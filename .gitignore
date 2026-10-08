@@ -1,0 +1,6 @@
+/target
+/.pi/
+/.idea/
+docs/
+Cargo.lock
+config.toml
