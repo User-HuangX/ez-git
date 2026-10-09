@@ -1,5 +1,7 @@
 //! 右侧文件 diff 面板：完整上下文、增删行高亮和编辑器状态。
 
+use std::path::Path;
+
 use gpui_kit::component::input::{
     Editor, EditorState, RangeDecoration, RangeDecorationCollection, RangeDecorationStyle,
 };
@@ -63,6 +65,16 @@ impl DiffView {
         self.path = path;
         self.folder = folder;
         self.error = None;
+        // 按文件后缀选语法；注册表自己认别名（rs/md/yml/ts…），不认得的当纯文本
+        let language = self
+            .path
+            .as_deref()
+            .and_then(|path| Path::new(path).extension())
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("text");
+        self.state
+            .update(cx, |state, cx| state.set_highlighter(language, cx));
+
         self.pending = Some(match lines {
             Ok(lines) => lines,
             Err(err) => {

@@ -20,7 +20,7 @@ const REPO_CONFIG_FILE: &str = "ez-git.toml";
 const DEFAULT_HISTORY_LIMIT: usize = 20;
 
 /// 应用级配置：打开过的仓库目录（最近使用在前），以及作者、邮箱兜底。
-#[derive(Deserialize, Serialize)]
+#[derive(Default, Deserialize, Serialize)]
 pub struct Config {
     /// 打开历史的上限，可在 config.toml 里修改。
     #[serde(default)]
@@ -31,17 +31,6 @@ pub struct Config {
     pub author: String,
     #[serde(default)]
     pub email: String,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            history_limit: DEFAULT_HISTORY_LIMIT,
-            repositories: Vec::new(),
-            author: String::new(),
-            email: String::new(),
-        }
-    }
 }
 
 impl Config {

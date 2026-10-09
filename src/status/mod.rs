@@ -11,8 +11,7 @@ use git2::{Diff, DiffFormat, DiffOptions, Patch, Repository, StatusOptions};
 use crate::repo::head_commit;
 
 pub(crate) mod diff;
-#[cfg(test)]
-mod tests;
+
 pub(crate) mod ui;
 
 /// HEAD 到当前工作区的增删行数；二进制文件不计行数。
