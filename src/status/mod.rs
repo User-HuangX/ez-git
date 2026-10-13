@@ -11,8 +11,12 @@ use git2::{Diff, DiffFormat, DiffOptions, Patch, Repository, StatusOptions};
 use crate::repo::head_commit;
 
 pub(crate) mod diff;
+pub(crate) mod file_icons;
 
 pub(crate) mod ui;
+
+#[cfg(test)]
+mod tests;
 
 /// HEAD 到当前工作区的增删行数；二进制文件不计行数。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -169,6 +173,8 @@ pub enum Node {
         path: String,
         change: Change,
         stats: LineStats,
+        /// 暂存区里相对 HEAD 有改动；就是提交模式里的打钩状态。
+        staged: bool,
     },
 }
 
@@ -184,13 +190,13 @@ impl Node {
 /// 读仓库里所有文件并标出改动类型；目录按名字排序并排在文件前面。
 pub fn tree(repo: &Repository) -> Result<Vec<Node>> {
     // 索引里的文件就是已跟踪文件，默认没改动；状态再覆盖或补上未跟踪文件
-    let mut files: BTreeMap<String, (Change, LineStats)> = repo
+    let mut files: BTreeMap<String, (Change, LineStats, bool)> = repo
         .index()?
         .iter()
         .map(|entry| {
             (
                 String::from_utf8_lossy(&entry.path).into_owned(),
-                (Change::Clean, LineStats::default()),
+                (Change::Clean, LineStats::default(), false),
             )
         })
         .collect();
@@ -201,16 +207,31 @@ pub fn tree(repo: &Repository) -> Result<Vec<Node>> {
         files.insert(
             // 路径不保证是合法 UTF-8，保留 lossy 转换，避免整个状态读取失败。
             String::from_utf8_lossy(entry.path_bytes()).into_owned(),
-            (change_of(entry.status()), LineStats::default()),
+            (
+                change_of(entry.status()),
+                LineStats::default(),
+                is_staged(entry.status()),
+            ),
         );
     }
     for (path, stats) in git_line_stats(repo)? {
-        if let Some((_, counts)) = files.get_mut(&path) {
+        if let Some((_, counts, _)) = files.get_mut(&path) {
             *counts = stats;
         }
     }
 
     Ok(build(files))
+}
+
+/// 暂存区里相对 HEAD 有没有改动。
+fn is_staged(status: git2::Status) -> bool {
+    status.intersects(
+        git2::Status::INDEX_NEW
+            | git2::Status::INDEX_MODIFIED
+            | git2::Status::INDEX_DELETED
+            | git2::Status::INDEX_RENAMED
+            | git2::Status::INDEX_TYPECHANGE,
+    )
 }
 
 /// 状态位 → 颜色。删除优先，其次修改，最后新增；冲突按修改处理。
@@ -239,19 +260,19 @@ fn change_of(status: git2::Status) -> Change {
 #[derive(Default)]
 struct Builder {
     dirs: BTreeMap<String, Builder>,
-    files: BTreeMap<String, (Change, LineStats)>,
+    files: BTreeMap<String, (Change, LineStats, bool)>,
 }
 
 impl Builder {
-    fn insert(&mut self, path: &str, change: Change, stats: LineStats) {
+    fn insert(&mut self, path: &str, change: Change, stats: LineStats, staged: bool) {
         match path.split_once('/') {
             Some((dir, rest)) => self
                 .dirs
                 .entry(dir.to_string())
                 .or_default()
-                .insert(rest, change, stats),
+                .insert(rest, change, stats, staged),
             None => {
-                self.files.insert(path.to_string(), (change, stats));
+                self.files.insert(path.to_string(), (change, stats, staged));
             }
         }
     }
@@ -278,21 +299,22 @@ impl Builder {
             .chain(
                 self.files
                     .into_iter()
-                    .map(|(name, (change, stats))| Node::File {
+                    .map(|(name, (change, stats, staged))| Node::File {
                         path: join(&name),
                         name,
                         change,
                         stats,
+                        staged,
                     }),
             )
             .collect()
     }
 }
 
-fn build(files: BTreeMap<String, (Change, LineStats)>) -> Vec<Node> {
+fn build(files: BTreeMap<String, (Change, LineStats, bool)>) -> Vec<Node> {
     let mut builder = Builder::default();
-    for (path, (change, stats)) in files {
-        builder.insert(&path, change, stats);
+    for (path, (change, stats, staged)) in files {
+        builder.insert(&path, change, stats, staged);
     }
     builder.into_nodes("")
 }
