@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::form::field;
 use gpui_kit::component::group_box::{GroupBox, GroupBoxVariants};
 use gpui_kit::component::input::{
     Input, InputGroup, InputGroupAddon, InputGroupAddonAlignment, InputGroupButton,
@@ -499,28 +500,18 @@ impl Render for ConfigView {
                                 h_flex()
                                     .gap_4()
                                     .child(
-                                        v_flex()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .gap_2()
-                                            .child(div().child("作者"))
-                                            .child(
-                                                Input::new(&self.author)
-                                                    .aria_label("提交作者")
-                                                    .disabled(!has_repo),
-                                            ),
+                                        field().flex_1().min_w_0().label("作者").child(
+                                            Input::new(&self.author)
+                                                .aria_label("提交作者")
+                                                .disabled(!has_repo),
+                                        ),
                                     )
                                     .child(
-                                        v_flex()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .gap_2()
-                                            .child(div().child("邮箱"))
-                                            .child(
-                                                Input::new(&self.email)
-                                                    .aria_label("提交邮箱")
-                                                    .disabled(!has_repo),
-                                            ),
+                                        field().flex_1().min_w_0().label("邮箱").child(
+                                            Input::new(&self.email)
+                                                .aria_label("提交邮箱")
+                                                .disabled(!has_repo),
+                                        ),
                                     ),
                             )
                             .child(
@@ -548,7 +539,7 @@ impl Render for ConfigView {
                                     .child("远程与克隆"),
                             )
                             .child(
-                                v_flex().gap_2().child(div().child("远程地址")).child(
+                                field().label("远程地址").child(
                                     InputGroup::new("remote-address")
                                         .input(
                                             InputGroupInput::new(&self.remote_url)
@@ -569,7 +560,7 @@ impl Render for ConfigView {
                                 ),
                             )
                             .child(
-                                v_flex().gap_2().child(div().child("克隆到")).child(
+                                field().label("克隆到").child(
                                     InputGroup::new("clone-directory")
                                         .input(
                                             InputGroupInput::new(&self.clone_dir)

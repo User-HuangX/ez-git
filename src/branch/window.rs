@@ -7,8 +7,14 @@ use anyhow::{Context as _, Result};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::alert::Alert;
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::description_list::DescriptionList;
+use gpui_kit::component::form::field;
 use gpui_kit::component::group_box::{GroupBox, GroupBoxVariants};
 use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::resizable::{h_resizable, resizable_panel};
+use gpui_kit::component::sidebar::{Sidebar, SidebarGroup, SidebarMenu, SidebarMenuItem};
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{ActiveTheme, Disableable, Icon, StyledExt, WindowExt, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -44,7 +50,7 @@ pub(crate) fn open(cx: &mut App) -> Result<()> {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds {
             origin: point(px(200.), px(120.)),
-            size: size(px(980.), px(740.)),
+            size: size(px(1420.), px(800.)),
         })),
         window_min_size: Some(size(px(820.), px(580.))),
         titlebar: Some(TitlebarOptions {
@@ -290,19 +296,13 @@ impl BranchView {
                         .child("定时 Pull"),
                 )
                 .child(
-                    v_flex()
-                        .gap_2()
-                        .child(div().text_sm().child("执行周期（秒）"))
+                    field()
+                        .label("执行周期（秒）")
+                        .description("10～86400 秒，默认 300 秒")
                         .child(
                             Input::new(&self.period)
                                 .aria_label("自动 Pull 周期，单位秒")
                                 .disabled(disabled),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("10～86400 秒，默认 300 秒"),
                         ),
                 )
                 .child(
@@ -317,16 +317,12 @@ impl BranchView {
                                 })),
                         )
                         .child(
-                            Button::new("toggle-auto-pull")
-                                .label(if enabled {
-                                    "停用自动 Pull"
-                                } else {
-                                    "开启自动 Pull"
-                                })
-                                .toggled(enabled)
+                            Switch::new("toggle-auto-pull")
+                                .label("自动 Pull")
+                                .checked(enabled)
                                 .disabled(disabled)
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.save_auto_pull(!enabled, window, cx)
+                                .on_change(cx.listener(move |this, enabled, window, cx| {
+                                    this.save_auto_pull(*enabled, window, cx)
                                 })),
                         ),
                 )
@@ -392,36 +388,174 @@ impl BranchView {
             )
     }
 
-    fn branch_row(&self, index: usize, branch: &BranchInfo, cx: &mut Context<Self>) -> Button {
+    fn history_panel(&self, cx: &mut Context<Self>) -> Div {
+        let muted = cx.theme().muted_foreground;
+        let mut panel = v_flex()
+            .size_full()
+            .flex_shrink_0()
+            .min_h_0()
+            .border_l_1()
+            .border_color(cx.theme().border)
+            .p_4()
+            .gap_3()
+            .child(div().font_medium().child("提交历史树"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(muted)
+                    .child("● 提交节点 · 从上到下由新到旧 · 连线指向父提交"),
+            );
+        let Some(state) = &self.state else {
+            return panel.child("正在读取历史…");
+        };
+        if state.history.is_empty() {
+            return panel.child("暂无提交，请先完成第一次提交。");
+        }
+        let nodes = state.history.clone();
+        let positions: std::collections::HashMap<_, _> = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.oid, (index, node.lane)))
+            .collect();
+        let width = (nodes.iter().map(|n| n.lane).max().unwrap_or(0) + 1) as f32 * 24. + 16.;
+        let height = nodes.len() as f32 * 68.;
+        let graph = canvas(
+            |_, _, _| (),
+            move |bounds, _, window, _| {
+                for (row, node) in nodes.iter().enumerate() {
+                    let from = point(
+                        bounds.left() + px(16. + node.lane as f32 * 24.),
+                        bounds.top() + px(row as f32 * 68. + 24.),
+                    );
+                    let color = hsla((node.lane as f32 * 0.173 + 0.57) % 1., 0.65, 0.58, 1.);
+                    for parent in &node.parents {
+                        let target = positions.get(parent);
+                        let to = target
+                            .map(|(i, lane)| {
+                                point(
+                                    bounds.left() + px(16. + *lane as f32 * 24.),
+                                    bounds.top() + px(*i as f32 * 68. + 24.),
+                                )
+                            })
+                            .unwrap_or(point(from.x, bounds.bottom()));
+                        let mut path = PathBuilder::stroke(px(2.));
+                        path.move_to(from);
+                        path.line_to(point(from.x, from.y + px(20.)));
+                        path.line_to(to);
+                        if let Ok(path) = path.build() {
+                            window.paint_path(path, color);
+                        }
+                    }
+                }
+            },
+        )
+        .w(px(width))
+        .h(px(height));
+        let mut graph_column = div()
+            .relative()
+            .w(px(width))
+            .h(px(height))
+            .flex_shrink_0()
+            .child(graph);
+        let mut rows = v_flex().flex_1().min_w(px(220.));
+        for (index, node) in state.history.iter().enumerate() {
+            let selected = state
+                .branches
+                .iter()
+                .any(|b| Some(&b.reference) == self.selected.as_ref() && b.oid == node.oid);
+            let color = hsla((node.lane as f32 * 0.173 + 0.57) % 1., 0.65, 0.58, 1.);
+            graph_column = graph_column.child(
+                div()
+                    .absolute()
+                    .left(px(10. + node.lane as f32 * 24.))
+                    .top(px(index as f32 * 68. + 18.))
+                    .size(px(12.))
+                    .rounded_full()
+                    .bg(color)
+                    .border_2()
+                    .border_color(if selected {
+                        cx.theme().foreground
+                    } else {
+                        cx.theme().background
+                    }),
+            );
+            let mut labels = Vec::new();
+            if state.head == Some(node.oid) {
+                labels.push("HEAD".to_string());
+            }
+            labels.extend(
+                state
+                    .branches
+                    .iter()
+                    .filter(|b| b.oid == node.oid)
+                    .map(|b| b.name.clone()),
+            );
+            rows = rows.child(
+                v_flex()
+                    .h(px(68.))
+                    .flex_shrink_0()
+                    .justify_center()
+                    .gap_1()
+                    .child(
+                        h_flex().gap_1().overflow_hidden().children(
+                            labels
+                                .into_iter()
+                                .map(|label| Tag::secondary().child(label)),
+                        ),
+                    )
+                    .child(div().text_sm().truncate().child(node.summary.clone()))
+                    .child(div().text_xs().text_color(muted).child(format!(
+                        "{} · {}",
+                        &node.oid.to_string()[..8],
+                        node.author
+                    ))),
+            );
+        }
+        panel = panel.child(
+            div()
+                .id("branch-history-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_scroll()
+                .child(h_flex().items_start().child(graph_column).child(rows)),
+        );
+        panel.child(div().text_xs().text_color(muted).child(format!(
+            "显示最近 {} 个提交（最多 {} 个）；底部延伸线表示更早历史",
+            state.history.len(),
+            super::history::LIMIT
+        )))
+    }
+
+    fn branch_row(
+        &self,
+        _index: usize,
+        branch: &BranchInfo,
+        cx: &mut Context<Self>,
+    ) -> SidebarMenuItem {
         let current = self
             .state
             .as_ref()
             .and_then(|state| state.current.as_ref())
             .is_some_and(|name| !branch.remote && name == &branch.name);
         let reference = branch.reference.clone();
-        Button::new(("branch-row", index))
-            .ghost()
-            .icon(if branch.remote {
-                IconName::CloudDownload
-            } else {
-                IconName::GitBranch
-            })
-            .w_full()
-            .justify_start()
-            .overflow_hidden()
-            .label(if current {
-                format!("{}（当前）", branch.name)
-            } else {
-                branch.name.clone()
-            })
-            .toggled(self.selected.as_ref() == Some(&branch.reference))
-            .disabled(self.busy.is_some())
-            .accessibility_label(format!("选择分支 {}", branch.name))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.selected = Some(reference.clone());
-                // 选择只更新详情，不暗中 Switch，也不打开主窗口的 diff。
-                cx.notify();
-            }))
+        SidebarMenuItem::new(if current {
+            format!("{}（当前）", branch.name)
+        } else {
+            branch.name.clone()
+        })
+        .icon(if branch.remote {
+            IconName::CloudDownload
+        } else {
+            IconName::GitBranch
+        })
+        .active(self.selected.as_ref() == Some(&branch.reference))
+        .disable(self.busy.is_some())
+        .accessibility_label(format!("选择分支 {}", branch.name))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.selected = Some(reference.clone());
+            // 选择只更新详情，不暗中 Switch，也不打开主窗口的 diff。
+            cx.notify();
+        }))
     }
 }
 
@@ -524,22 +658,28 @@ impl Render for BranchView {
                     .find(|branch| !branch.remote && branch.name == current)
             })
             .and_then(|branch| branch.upstream.as_ref());
-        let detail = selected
-            .map(|branch| {
-                let tracking = branch
-                    .tracking
-                    .map(|(ahead, behind)| format!(" · 领先 {ahead} / 落后 {behind}"))
-                    .unwrap_or_default();
-                format!(
-                    "{}\n{} · {}\n上游：{}{}",
-                    branch.name,
-                    &branch.oid.to_string()[..8],
-                    branch.summary,
-                    branch.upstream.as_deref().unwrap_or("未设置"),
-                    tracking
-                )
+        let detail = DescriptionList::vertical()
+            .columns(1)
+            .when_some(selected, |list, branch| {
+                list.item("分支", branch.name.clone(), 1)
+                    .item("提交", branch.oid.to_string()[..8].to_string(), 1)
+                    .item("标题", branch.summary.clone(), 1)
+                    .item(
+                        "上游",
+                        branch.upstream.clone().unwrap_or_else(|| "未设置".into()),
+                        1,
+                    )
+                    .when_some(branch.tracking, |list, (ahead, behind)| {
+                        list.item("同步状态", format!("领先 {ahead} / 落后 {behind}"), 1)
+                    })
             })
-            .unwrap_or_else(|| "选择左侧分支查看详情；新仓库需先完成第一次提交。".to_string());
+            .when(selected.is_none(), |list| {
+                list.item(
+                    "提示",
+                    "选择左侧分支查看详情；新仓库需先完成第一次提交。",
+                    1,
+                )
+            });
         let client_decorations = matches!(window.window_decorations(), Decorations::Client { .. });
 
         v_flex().size_full().bg(cx.theme().background).text_color(cx.theme().foreground)
@@ -553,14 +693,14 @@ impl Render for BranchView {
                 .when(client_decorations, |header| header.child(Button::new("close-branches").ghost()
                     .icon(IconName::Close).accessibility_label("关闭分支窗口").disabled(self.busy.is_some())
                     .on_click(|_, window, _| window.remove_window()))))
-            .child(h_flex().flex_1().min_h_0().items_stretch()
-                .child(v_flex().id("branch-list").w(px(260.)).min_h_0().flex_shrink_0().p_4().gap_2()
-                    .bg(cx.theme().tokens.group_box).border_r_1().border_color(cx.theme().border).overflow_y_scroll()
-                    .child(div().text_xs().font_medium().text_color(muted).child(format!("本地分支  {}", local_rows.len())))
-                    .children(local_rows)
-                    .child(div().mt_4().text_xs().font_medium().text_color(muted).child(format!("远程跟踪分支  {}", remote_rows.len())))
-                    .children(remote_rows))
-                .child(v_flex().id("branch-details").flex_1().min_w_0().min_h_0().p_5().gap_5().text_sm().overflow_y_scroll()
+            .child(div().flex_1().min_h_0().child(h_resizable("branch-panels" )
+                .child(resizable_panel().size(px(220.)).size_range(px(160.)..px(420.)).child(
+                    Sidebar::new("branch-list").w_full()
+                        .child(SidebarGroup::new(format!("本地分支  {}", local_rows.len()))
+                            .child(SidebarMenu::new().children(local_rows)))
+                        .child(SidebarGroup::new(format!("远程跟踪分支  {}", remote_rows.len()))
+                            .child(SidebarMenu::new().children(remote_rows)))))
+                .child(resizable_panel().size_range(px(280.)..px(1800.)).child(v_flex().id("branch-details").flex_1().min_w_0().min_h_0().p_5().gap_5().text_sm().overflow_y_scroll()
                     .child(v_flex().gap_1()
                         .child(div().font_medium().child(format!("当前分支：{current}")))
                         .child(div().text_xs().text_color(muted).child(progress_text)))
@@ -570,7 +710,7 @@ impl Render for BranchView {
                         Err(message) => Alert::error("branch-result", message),
                     }))
                     .child(GroupBox::new().id("branch-target-group").outline().title("选择的分支")
-                        .child(div().text_sm().child(detail))
+                        .child(detail)
                         .child(h_flex().gap_2().flex_wrap()
                             .child(self.action_button("switch-branch", "Switch 切换", Operation::Switch(target.clone()), clean && selected.is_some_and(|branch| !branch.remote) && !same, cx))
                             .child(self.action_button("merge-branch", "Merge 合入当前", Operation::Merge(target.clone()), integrate, cx))
@@ -589,7 +729,7 @@ impl Render for BranchView {
                         .footer("Fetch 更新远程引用，Pull 只快进。分叉时先选择上游分支，再合并或变基。"))
                     .child(self.auto_pull_panel(cx))
                     .child(GroupBox::new().id("branch-create-group").outline().title("新建本地分支")
-                        .child(Input::new(&self.name).aria_label("新分支名称").disabled(self.busy.is_some() || !idle))
+                        .child(field().label("新分支名称").child(Input::new(&self.name).aria_label("新分支名称").disabled(self.busy.is_some() || !idle)))
                         .child(self.action_button("create-branch", "从当前 HEAD 新建", Operation::Create(new_name.clone()), idle && has_head && !new_name.is_empty(), cx))
                         .footer("新建只创建分支，不自动切换。选择新分支后点击 Switch。"))
                     .when(recover, |panel| panel.child(GroupBox::new().id("branch-conflicts-group").outline().title("冲突与恢复")
@@ -599,5 +739,6 @@ impl Render for BranchView {
                             .child(self.action_button("continue-branch-op", "继续操作", Operation::Continue, resolved, cx))
                             .when(state.is_some_and(|state| state.progress == Progress::Rebase), |actions| actions.child(self.action_button("skip-rebase-commit", "跳过当前提交…", Operation::Skip, true, cx)))
                             .child(self.action_button("abort-branch-op", "中止操作…", Operation::Abort, true, cx)))))))
+                .child(resizable_panel().size(px(320.)).size_range(px(260.)..px(1600.)).child(self.history_panel(cx)))))
     }
 }

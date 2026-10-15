@@ -11,6 +11,7 @@ use crate::config::RepoConfig;
 use crate::repo::{conflict_paths, git_get_repo};
 
 pub(crate) mod auto_pull;
+mod history;
 pub(crate) mod window;
 
 #[cfg(test)]
@@ -50,6 +51,7 @@ pub(crate) struct BranchInfo {
 #[derive(Clone, Debug)]
 pub(crate) struct Snapshot {
     pub branches: Vec<BranchInfo>,
+    pub history: Vec<history::CommitNode>,
     pub current: Option<String>,
     pub head: Option<Oid>,
     pub remotes: Vec<String>,
@@ -141,7 +143,9 @@ pub(crate) fn snapshot(path: &Path) -> Result<Snapshot> {
     opts.include_untracked(true).recurse_untracked_dirs(true);
     let dirty = repo.statuses(Some(&mut opts))?.len();
     let conflicts = conflict_paths(&repo)?;
+    let history = history::load(&repo, &branches, head)?;
     Ok(Snapshot {
+        history,
         branches,
         current,
         head,

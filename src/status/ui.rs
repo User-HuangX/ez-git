@@ -544,7 +544,7 @@ impl Render for StatusTree {
 
         v_flex()
             .h_full()
-            .w(px(320.))
+            .w_full()
             .flex_shrink_0()
             .bg(cx.theme().tokens.group_box)
             .border_r_1()

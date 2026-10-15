@@ -61,6 +61,49 @@ impl Drop for Fixture {
     }
 }
 
+#[test]
+fn history_includes_branch_tips_and_merge_parents() {
+    let fixture = Fixture::new();
+    let root = fixture.commit("base", "base", "root");
+    let repo = fixture.repo();
+    repo.branch("side", &repo.find_commit(root).unwrap(), false)
+        .unwrap();
+    let main = fixture.commit("main", "main", "main commit");
+    fixture
+        .run(Operation::Switch("refs/heads/side".into()))
+        .unwrap();
+    let side = fixture.commit("side", "side", "side commit");
+    fixture
+        .run(Operation::Switch("refs/heads/main".into()))
+        .unwrap();
+    fixture
+        .run(Operation::Merge("refs/heads/side".into()))
+        .unwrap();
+    let state = snapshot(&fixture.0).unwrap();
+    let merge = &state.history[0];
+    assert_eq!(Some(merge.oid), state.head);
+    assert_eq!(merge.parents, vec![main, side]);
+    for (index, node) in state.history.iter().enumerate() {
+        for parent in &node.parents {
+            let parent_index = state.history.iter().position(|n| n.oid == *parent).unwrap();
+            assert!(parent_index > index);
+        }
+    }
+    assert_eq!(state.history.last().unwrap().oid, root);
+}
+
+#[test]
+fn history_handles_unborn_and_detached_head() {
+    let fixture = Fixture::new();
+    assert!(snapshot(&fixture.0).unwrap().history.is_empty());
+    let oid = fixture.commit("base", "base", "root");
+    fixture.repo().set_head_detached(oid).unwrap();
+    let state = snapshot(&fixture.0).unwrap();
+    assert_eq!(state.head, Some(oid));
+    assert_eq!(state.history.len(), 1);
+    assert_eq!(state.history[0].oid, oid);
+}
+
 fn configure(repo: &Repository) {
     let mut config = repo.config().unwrap();
     config.set_str("user.name", "Test").unwrap();

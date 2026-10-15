@@ -1,65 +1,50 @@
-//! 右侧文件 diff 面板：完整上下文、增删行高亮和编辑器状态。
-
-use std::path::Path;
-
+//! 专用 Diff 组件负责行号、语法高亮、选择复制和增删行展示。
 use gpui_kit::assets::IconName;
 use gpui_kit::component::alert::Alert;
-use gpui_kit::component::input::{
-    Editor, EditorState, RangeDecoration, RangeDecorationCollection, RangeDecorationStyle,
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::diff::{
+    Diff, DiffFile, DiffLinePosition, DiffLineRange, DiffMode, DiffSide, DiffState,
 };
-use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme, Icon, StyledExt, h_flex, v_flex};
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::{ActiveTheme, Icon, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::file_icons::icon_for;
 use super::{DiffKind, DiffLine};
 
-const ADDED_BG: u32 = 0x56d36459;
-const DELETED_BG: u32 = 0xf8514959;
-
-/// 右侧面板：选中文件的完整改动，交给 Editor 组件显示。
-///
-/// 文本是整篇 diff（未改动的原文也在里面），增行和删行分别用绿/红的
-/// [`RangeDecoration`] 底色铺出来，行距、选中、搜索、复制都用编辑器的。
 pub(crate) struct DiffView {
-    state: Entity<EditorState>,
-    /// 增删行的标记集合；内容变了就整批换掉
-    marks: RangeDecorationCollection,
+    state: Entity<DiffState>,
     path: Option<String>,
-    /// 选中的是目录（不显示 diff，只给提示）
     folder: bool,
+    empty: bool,
     error: Option<SharedString>,
-    /// 编辑器里现在装的语言；没变就不要再设高亮器（设一次就得重编译 tree-sitter 查询）。
-    language: Option<String>,
-    /// 待渲染的 diff；换文本需要 window，因此延迟到 render。
-    pending: Option<Vec<DiffLine>>,
+    search: Entity<InputState>,
+    searchable: Vec<(DiffSide, usize, String)>,
+    search_cursor: usize,
+    search_result: String,
 }
 
 impl DiffView {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索文件内容"));
         let state = cx.new(|cx| {
-            // 行号是 diff 文本自己的行号（从 1 数到最后一行），不是文件行号
-            EditorState::new(window, cx)
-                .line_number(true)
-                .default_value("")
+            DiffState::new([], cx)
+                .with_mode(DiffMode::Unified)
+                .with_context_lines(None)
         });
-        let marks = state.update(cx, |state, cx| {
-            state.create_range_decorations_collection(Vec::new(), cx)
-        });
-
         Self {
             state,
-            marks,
             path: None,
             folder: false,
+            empty: true,
             error: None,
-            language: None,
-            pending: None,
+            search,
+            searchable: Vec::new(),
+            search_cursor: 0,
+            search_result: String::new(),
         }
     }
 
-    /// 换文件并带上算好的 diff；目录或没得看就传空。
     pub(crate) fn show(
         &mut self,
         path: Option<String>,
@@ -70,230 +55,296 @@ impl DiffView {
         self.path = path;
         self.folder = folder;
         self.error = None;
-        // 按文件后缀选语法；注册表自己认别名（rs/md/yml/ts…），不认得的当纯文本
-        let language = self
-            .path
-            .as_deref()
-            .and_then(|path| Path::new(path).extension())
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("text");
-        // 语言真的变了才重设：set_highlighter 会丢掉高亮器，下次解析要重编译查询（几十毫秒）
-        if self.language.as_deref() != Some(language) {
-            self.language = Some(language.to_string());
-            self.state
-                .update(cx, |state, cx| state.set_highlighter(language, cx));
-        }
-        self.pending = Some(match lines {
-            Ok(lines) => lines,
+        self.search_cursor = 0;
+        self.search_result.clear();
+        self.searchable.clear();
+        let files = lines.and_then(|lines| {
+            self.searchable = searchable_lines(&lines);
+            files_from_lines(self.path.as_deref().unwrap_or("file"), &lines)
+        });
+        let files = match files {
+            Ok(files) => files,
             Err(err) => {
                 self.error = Some(format!("{err:#}").into());
                 Vec::new()
             }
-        });
+        };
+        self.empty = files.is_empty();
+        self.state
+            .update(cx, |state, cx| state.set_files(files, cx));
+        cx.notify();
+    }
+}
+
+impl DiffView {
+    fn find_next(&mut self, cx: &mut Context<Self>) {
+        let query = self.search.read(cx).value().to_lowercase();
+        if query.is_empty() {
+            return;
+        }
+        let matches: Vec<_> = self
+            .searchable
+            .iter()
+            .filter(|(_, _, text)| text.to_lowercase().contains(&query))
+            .collect();
+        if matches.is_empty() {
+            self.search_result = "无匹配".into();
+        } else if let Some(path) = self
+            .state
+            .read(cx)
+            .files()
+            .first()
+            .map(|f| f.path().clone())
+        {
+            let index = self.search_cursor % matches.len();
+            let (side, line, _) = matches[index];
+            self.state.update(cx, |state, cx| {
+                state.set_selected_lines(
+                    Some(DiffLineRange::new(path.clone(), *side, *line, *line)),
+                    cx,
+                );
+                state.scroll_to_line(DiffLinePosition::new(path, *side, *line), cx);
+            });
+            self.search_result = format!("{} / {}", index + 1, matches.len());
+            self.search_cursor = index + 1;
+        }
         cx.notify();
     }
 }
 
 impl Render for DiffView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // set_value 需要 window，所以文本在这里才推进编辑器
-        if let Some(lines) = self.pending.take() {
-            let started = std::time::Instant::now();
-            let (text, marks) = diff_text(&lines);
-            let built = started.elapsed();
-            // 长度不同就直接换；长度相同（刷新同一个文件）才逐字比，省掉每个文件都整篇比一次
-            let state = self.state.read(cx);
-            let differs = state.text().len() != text.len() || state.text() != text.as_str();
-            // set_value 会把 text 拿走，长度先记下来给下面打印用
-            let text_len = text.len();
-            let swap = std::time::Instant::now();
-            if differs {
-                self.state.update(cx, |state, cx| {
-                    // 元素把 readonly 写进了 state，换文本那条路会检查 is_editable()：
-                    // 先暂时放开、换完再关上（set_value 内部也是这么做的）。
-                    state.set_readonly(false, cx);
-                    // 走输入事件那条路换文本：set_value 会顺带丢掉高亮器，
-                    // 下次解析就得重编译 tree-sitter 查询（release 约 35ms 一次）。
-                    let utf16_len: usize = state.text().chars().map(char::len_utf16).sum();
-                    state.replace_text_in_range(Some(0..utf16_len), &text, window, cx);
-                    // set_value 顺带做的事自己补：清掉选中、滚回顶部
-                    state.set_selected_range(0..0, cx);
-                    state.set_scroll_offset(point(px(0.), px(0.)), cx);
-                    state.set_readonly(true, cx);
-                });
-            }
-            let swapped = swap.elapsed();
-            let marks_started = std::time::Instant::now();
-            self.marks.set(marks, cx);
-            if std::env::var_os("EZ_GIT_TRACE").is_some() {
-                eprintln!(
-                    "[diff] {} 行 / {} 字节：攒文本 {:?}，换文本 {:?}，装装饰 {:?}",
-                    lines.len(),
-                    text_len,
-                    built,
-                    swapped,
-                    marks_started.elapsed()
-                );
-            }
-        }
-
-        let empty = self.state.read(cx).text().len() == 0;
-        let hint = match self.path.as_deref() {
-            None => Some("选择文件，查看更改"),
-            Some(_) if self.folder => Some("选择目录中的文件"),
-            Some(_) if self.error.is_none() && empty => Some("没有可显示的内容"),
-            Some(_) => None,
-        };
-        let full_path = self.path.clone().unwrap_or_else(|| "Diff 预览".to_string());
-        let path = Path::new(&full_path);
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(&full_path)
-            .to_string();
-        let parent = path
-            .parent()
-            .and_then(|parent| parent.to_str())
-            .filter(|parent| !parent.is_empty())
-            .unwrap_or("工作区")
-            .to_string();
-        let icon = if self.folder {
-            IconName::FolderOpen
-        } else if self.path.is_some() {
-            icon_for(&full_path)
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let hint = if self.path.is_none() {
+            Some("选择文件，查看更改")
+        } else if self.folder {
+            Some("选择目录中的文件")
+        } else if self.empty {
+            Some("没有可显示的内容")
         } else {
-            IconName::FileDiff
+            None
         };
-
         v_flex()
             .flex_1()
             .min_w_0()
+            .min_h_0()
             .h_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(
                 h_flex()
-                    .id("diff-file-header")
                     .h_12()
-                    .w_full()
                     .px_4()
                     .gap_3()
                     .items_center()
                     .bg(cx.theme().tokens.group_box)
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(
-                        Icon::new(icon)
-                            .size_4()
-                            .text_color(cx.theme().muted_foreground),
-                    )
-                    .child(div().text_sm().font_medium().child(name))
-                    // 没选文件时不显示无意义的路径占位
-                    .when(self.path.is_some(), |header| {
-                        header.child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(parent),
-                        )
-                    })
+                    .child(Icon::new(IconName::FileDiff).size_4())
                     .child(
                         div()
-                            .px_2()
-                            .py_0p5()
-                            .rounded_md()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("只读"),
-                    )
-                    .tooltip(move |window, cx| Tooltip::new(full_path.clone()).build(window, cx)),
+                            .text_sm()
+                            .truncate()
+                            .child(self.path.clone().unwrap_or_else(|| "Diff 预览".into())),
+                    ),
             )
             .when_some(self.error.clone(), |panel, error| {
-                panel.child(div().p_4().child(Alert::error("diff-error", error)))
+                panel.child(Alert::error("diff-error", error))
             })
-            .when_some(hint, |panel, title| {
+            .when_some(hint, |panel, hint| {
                 panel.child(
-                    v_flex()
-                        .flex_1()
-                        .min_h_0()
-                        .items_center()
-                        .justify_center()
+                    div()
                         .p_8()
-                        .gap_3()
-                        .child(
-                            Icon::new(IconName::FileDiff)
-                                .size_10()
-                                .text_color(cx.theme().muted_foreground),
-                        )
-                        .child(div().text_lg().font_medium().child(title))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("完整内容与增删行会显示在这里。"),
-                        ),
+                        .text_color(cx.theme().muted_foreground)
+                        .child(hint),
                 )
             })
             .when(hint.is_none(), |panel| {
-                panel.child(
-                    Editor::new(&self.state)
-                        .readonly(true)
-                        .appearance(false)
-                        .bordered(false)
-                        .aria_label("文件内容与 Diff")
-                        .flex_1()
-                        .min_h_0(),
-                )
+                panel
+                    .child(
+                        h_flex()
+                            .px_4()
+                            .py_2()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                Input::new(&self.search)
+                                    .aria_label("搜索 Diff 内容")
+                                    .flex_1(),
+                            )
+                            .child(
+                                Button::new("find-next")
+                                    .ghost()
+                                    .label("查找下一个")
+                                    .on_click(cx.listener(|this, _, _, cx| this.find_next(cx))),
+                            )
+                            .child(div().text_xs().child(self.search_result.clone())),
+                    )
+                    .child(
+                        Diff::new(&self.state)
+                            .header_visible(false)
+                            .line_number(true)
+                            .syntax_highlight(true)
+                            .change_background(true)
+                            .flex_1()
+                            .min_h_0(),
+                    )
             })
     }
 }
 
-/// 把 diff 行拼成一整篇文本，同时算出增行/删行的字节范围。
-///
-/// 连续同类行合成一个范围：两万行的大文件不至于堆出两万个装饰。
-pub(super) fn diff_text(lines: &[DiffLine]) -> (String, Vec<RangeDecoration>) {
-    let mut text = String::new();
-    let mut marks = Vec::new();
-    // (范围起点, 范围终点, 颜色)，同类行一直往后接
-    let mut run: Option<(usize, usize, u32)> = None;
-
+/// 搜索使用真实文件行号，而不是含文件头的 patch 行号。
+fn searchable_lines(lines: &[DiffLine]) -> Vec<(DiffSide, usize, String)> {
+    let mut result = Vec::new();
+    let (mut old, mut new) = (1, 1);
     for line in lines {
-        let start = text.len();
-        text.push_str(&line.text);
-        let end = text.len();
-        text.push('\n');
-
-        let color = match line.kind {
-            DiffKind::Added => ADDED_BG,
-            DiffKind::Deleted => DELETED_BG,
-            DiffKind::Header | DiffKind::Context => {
-                push_run(&mut marks, run.take());
-                continue;
+        if line.kind == DiffKind::Header {
+            for header in line.text.lines().filter(|s| s.starts_with("@@ ")) {
+                let mut fields = header.split_whitespace().skip(1);
+                let start = |field: &str| {
+                    field
+                        .get(1..)
+                        .and_then(|s| s.split(',').next())
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(1)
+                };
+                if let (Some(a), Some(b)) = (fields.next(), fields.next()) {
+                    old = start(a);
+                    new = start(b);
+                }
             }
-        };
-        run = match run {
-            Some((run_start, _, run_color)) if run_color == color => Some((run_start, end, color)),
-            Some(done) => {
-                push_run(&mut marks, Some(done));
-                Some((start, end, color))
+            continue;
+        }
+        if line.text.starts_with('\\') {
+            continue;
+        }
+        match line.kind {
+            DiffKind::Deleted => {
+                result.push((DiffSide::Original, old, line.text.clone()));
+                old += 1;
             }
-            None => Some((start, end, color)),
-        };
+            DiffKind::Added => {
+                result.push((DiffSide::Modified, new, line.text.clone()));
+                new += 1;
+            }
+            DiffKind::Context => {
+                result.push((DiffSide::Modified, new, line.text.clone()));
+                old += 1;
+                new += 1;
+            }
+            DiffKind::Header => {}
+        }
     }
-    push_run(&mut marks, run.take());
-    (text, marks)
+    result
 }
 
-/// 把攒着的一串同类行收成一个填充范围。
-fn push_run(marks: &mut Vec<RangeDecoration>, run: Option<(usize, usize, u32)>) {
-    if let Some((start, end, color)) = run {
-        marks.push(
-            RangeDecoration::new(start..end)
-                .with_style(RangeDecorationStyle::Fill)
-                .with_color(rgba(color).into()),
-        );
+/// libgit2 的 patch 行已带换行；工作区原文行则没有，不能无条件添加空行。
+fn files_from_lines(path: &str, lines: &[DiffLine]) -> anyhow::Result<Vec<DiffFile>> {
+    if lines.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut patch = String::new();
+    if !lines.iter().any(|line| line.kind == DiffKind::Header) {
+        // unchanged 避免把文件名中的空格、引号解释成 patch 语法。
+        let text = lines
+            .iter()
+            .map(|line| line.text.strip_prefix(' ').unwrap_or(&line.text))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Ok(vec![DiffFile::unchanged(path.to_owned(), &text)]);
+    }
+    for line in lines {
+        patch.push_str(&line.text);
+        if !line.text.ends_with('\n') {
+            patch.push('\n');
+        }
+    }
+    Ok(DiffFile::parse(&patch)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DiffKind, DiffLine, DiffSide, files_from_lines, searchable_lines};
+
+    #[test]
+    fn parses_patch_without_extra_blank_lines() {
+        let lines = vec![
+            DiffLine {
+                kind: DiffKind::Header,
+                text: "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n".into(),
+            },
+            DiffLine {
+                kind: DiffKind::Deleted,
+                text: "-old\n".into(),
+            },
+            DiffLine {
+                kind: DiffKind::Added,
+                text: "+new\n".into(),
+            },
+        ];
+        let files = files_from_lines("a.rs", &lines).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].additions(), 1);
+        assert_eq!(files[0].deletions(), 1);
+    }
+
+    #[test]
+    fn search_uses_hunk_line_numbers_and_sides() {
+        let lines = vec![
+            DiffLine {
+                kind: DiffKind::Header,
+                text: "@@ -10,2 +20,2 @@\n".into(),
+            },
+            DiffLine {
+                kind: DiffKind::Context,
+                text: " context\n".into(),
+            },
+            DiffLine {
+                kind: DiffKind::Deleted,
+                text: "-old\n".into(),
+            },
+            DiffLine {
+                kind: DiffKind::Added,
+                text: "+new\n".into(),
+            },
+        ];
+        let positions = searchable_lines(&lines);
+        assert_eq!((positions[0].0, positions[0].1), (DiffSide::Modified, 20));
+        assert_eq!((positions[1].0, positions[1].1), (DiffSide::Original, 11));
+        assert_eq!((positions[2].0, positions[2].1), (DiffSide::Modified, 21));
+    }
+
+    #[test]
+    fn parses_add_delete_binary_and_missing_final_newline() {
+        for patch in [
+            "diff --git a/new b/new\nnew file mode 100644\n--- /dev/null\n+++ b/new\n@@ -0,0 +1 @@\n+hello\n",
+            "diff --git a/old b/old\ndeleted file mode 100644\n--- a/old\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n",
+            "diff --git a/a b/a\nBinary files a/a and b/a differ\n",
+            "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n",
+        ] {
+            let files = files_from_lines(
+                "a",
+                &[DiffLine {
+                    kind: DiffKind::Header,
+                    text: patch.into(),
+                }],
+            )
+            .unwrap();
+            assert_eq!(files.len(), 1);
+        }
+    }
+
+    #[test]
+    fn supports_unchanged_and_empty_files() {
+        assert!(files_from_lines("empty", &[]).unwrap().is_empty());
+        let files = files_from_lines(
+            "有 空格.rs",
+            &[DiffLine {
+                kind: DiffKind::Context,
+                text: " hello".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(files[0].path().as_ref(), "有 空格.rs");
+        assert!(!files[0].has_changes());
     }
 }

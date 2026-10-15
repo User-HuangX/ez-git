@@ -1,6 +1,7 @@
 //! 主窗口的组装与布局：工具栏、状态树、文件 diff。
 
-use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
+use gpui_kit::component::resizable::{h_resizable, resizable_panel};
+use gpui_kit::component::{ActiveTheme, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -83,12 +84,18 @@ impl Render for Workspace {
             .bg(cx.theme().background)
             .child(self.toolbar.clone())
             .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .items_stretch()
-                    .when(tree_expanded(cx), |this| this.child(self.tree.clone()))
-                    .child(self.diff.clone()),
+                div().flex_1().min_h_0().child(
+                    h_resizable("workspace-panels")
+                        .when(tree_expanded(cx), |this| {
+                            this.child(
+                                resizable_panel()
+                                    .size(px(320.))
+                                    .size_range(px(220.)..px(900.))
+                                    .child(self.tree.clone()),
+                            )
+                        })
+                        .child(resizable_panel().child(self.diff.clone())),
+                ),
             )
     }
 }
