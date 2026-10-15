@@ -153,7 +153,9 @@ fn diff_lines(diff: &Diff) -> Result<Vec<DiffLine>> {
 pub enum Change {
     /// 没有改动
     Clean,
-    /// 新增：未跟踪，或者新进了暂存区（绿）
+    /// 未跟踪：工作区中存在，但尚未加入 Git 索引。
+    Untracked,
+    /// 新增：已加入暂存区，但 HEAD 中不存在（绿）。
     Added,
     /// 修改：内容改动、改名或类型变化（黄）
     Modified,
@@ -255,8 +257,10 @@ fn change_of(status: git2::Status) -> Change {
             | S::WT_TYPECHANGE,
     ) {
         Change::Modified
-    } else if status.intersects(S::INDEX_NEW | S::WT_NEW) {
+    } else if status.contains(S::INDEX_NEW) {
         Change::Added
+    } else if status.contains(S::WT_NEW) {
+        Change::Untracked
     } else {
         Change::Clean
     }

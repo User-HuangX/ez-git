@@ -103,7 +103,7 @@ impl Render for Toolbar {
                     .items_center()
                     .child(tooltipped(
                         "分支",
-                        "分支管理：Fetch / Pull / Switch / Merge / Rebase".into(),
+                        "分支管理：Fetch / Pull / Checkout / Merge / Rebase".into(),
                         Button::new("branches")
                             .ghost()
                             .icon(IconName::GitBranch)

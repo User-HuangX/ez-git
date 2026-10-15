@@ -24,6 +24,7 @@ use crate::config::current_repo;
 use crate::repo::git_get_repo;
 use crate::status::{self, Change, LineStats, Node, git_file_diff};
 
+const BLUE: u32 = 0x60a5fa;
 const GREEN: u32 = 0x4ade80;
 const YELLOW: u32 = 0xfacc15;
 const RED: u32 = 0xf87171;
@@ -34,6 +35,7 @@ const CLEAN: u32 = 0xb0b0c0;
 /// 改动类型对应的颜色。
 fn color_of(change: Change) -> u32 {
     match change {
+        Change::Untracked => BLUE,
         Change::Added => GREEN,
         Change::Modified => YELLOW,
         Change::Deleted => RED,
@@ -438,7 +440,8 @@ impl Render for StatusTree {
                     rgb(color_of(change)).into()
                 };
                 let change_name = match change {
-                    Change::Added => "新增",
+                    Change::Untracked => "未跟踪（尚未加入 Git）",
+                    Change::Added => "新增（已加入暂存区）",
                     Change::Modified => "修改",
                     Change::Deleted => "删除",
                     Change::Conflicted => "冲突",
@@ -526,6 +529,7 @@ impl Render for StatusTree {
                                         .text_color(tone)
                                         .bg(tone.opacity(0.10))
                                         .child(match change {
+                                            Change::Untracked => "?",
                                             Change::Added => "A",
                                             Change::Modified => "M",
                                             Change::Deleted => "D",

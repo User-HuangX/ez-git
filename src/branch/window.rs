@@ -136,7 +136,7 @@ impl BranchView {
             Operation::Create(_) => "新建分支",
             Operation::Fetch(_) => "Fetch",
             Operation::Pull => "Pull",
-            Operation::Switch(_) => "Switch",
+            Operation::Checkout(_) => "Checkout",
             Operation::Merge(_) => "Merge",
             Operation::Rebase(_) => "Rebase",
             Operation::SetUpstream(_) => "设置上游",
@@ -332,12 +332,18 @@ impl BranchView {
     }
     fn confirm(&mut self, operation: Operation, window: &mut Window, cx: &mut Context<Self>) {
         let text = match &operation {
+            Operation::Pull if self.state.as_ref().is_some_and(|state| state.dirty != 0) => {
+                "Pull 会自动暂存已跟踪文件的未提交修改，拉取并合并上游后再恢复。合并或恢复修改时可能进入冲突模式。未跟踪文件不会自动暂存，若会被覆盖则 Git 拒绝操作。是否继续？".to_string()
+            }
+            Operation::Merge(_) if self.state.as_ref().is_some_and(|state| state.dirty != 0) => {
+                "Merge 会自动暂存已跟踪文件的本地修改，合并目标分支后恢复。合并或恢复时可能发生冲突。未跟踪文件不会自动暂存，有覆盖风险时 Git 将拒绝操作。是否继续？".to_string()
+            }
             Operation::Skip => {
                 "跳过变基中当前正在重放的提交，它的改动不会进入新分支历史；后续提交仍会继续重放。"
                     .to_string()
             }
             Operation::Rebase(reference) => format!(
-                "把当前分支变基到 {reference}。这会重写当前分支独有的提交；已推送的分支请谨慎操作。不会强制推送。"
+                "把当前分支变基到 {reference}。这会重写当前分支独有的提交；已推送的分支请谨慎操作。不会强制推送。未提交的已跟踪文件修改会自动暂存，变基后恢复；变基或恢复时可能发生冲突，未跟踪文件有覆盖风险时会拒绝操作。"
             ),
             Operation::Abort => {
                 "中止当前合并/变基并恢复操作前的状态。本次冲突解决的改动会被丢弃。".to_string()
@@ -553,7 +559,7 @@ impl BranchView {
         .accessibility_label(format!("选择分支 {}", branch.name))
         .on_click(cx.listener(move |this, _, _, cx| {
             this.selected = Some(reference.clone());
-            // 选择只更新详情，不暗中 Switch，也不打开主窗口的 diff。
+            // 选择只更新详情，不暗中 Checkout，也不打开主窗口的 diff。
             cx.notify();
         }))
     }
@@ -572,14 +578,14 @@ impl Render for BranchView {
             .and_then(|state| state.current.as_deref())
             .unwrap_or("detached HEAD");
         let idle = state.is_some_and(|state| state.progress == Progress::Idle);
-        let clean = state.is_some_and(|state| state.dirty == 0) && idle;
         let has_head = state.is_some_and(|state| state.head.is_some());
         let on_branch = state.is_some_and(|state| state.current.is_some());
         let target = self.selected.clone().unwrap_or_default();
         let same = selected.is_some_and(|branch| !branch.remote && branch.name == current);
-        let integrate = clean && has_head && on_branch && selected.is_some() && !same;
-        let recover =
+        let integrating =
             state.is_some_and(|state| matches!(state.progress, Progress::Merge | Progress::Rebase));
+        let restoring = state.is_some_and(|state| state.progress == Progress::WorktreeConflict);
+        let recover = integrating || restoring;
         let resolved = state.is_some_and(|state| state.conflicts.is_empty());
         let new_name = self.name.read(cx).value().trim().to_string();
         let selected_remote = self.remote.clone().unwrap_or_default();
@@ -630,8 +636,24 @@ impl Render for BranchView {
                         .gap_2()
                         .flex_wrap()
                         .child(div().flex_1().min_w_0().child(path.clone()))
-                        .child(resolve(("keep-ours", index), "用我的", Choice::Ours))
-                        .child(resolve(("keep-theirs", index), "用他的", Choice::Theirs))
+                        .child(resolve(
+                            ("keep-ours", index),
+                            if restoring {
+                                "保留整合结果"
+                            } else {
+                                "用我的"
+                            },
+                            Choice::Ours,
+                        ))
+                        .child(resolve(
+                            ("keep-theirs", index),
+                            if restoring {
+                                "保留本地修改"
+                            } else {
+                                "用他的"
+                            },
+                            Choice::Theirs,
+                        ))
                         .child(resolve(
                             ("resolve-conflict", index),
                             "标记已解决",
@@ -658,6 +680,52 @@ impl Render for BranchView {
                     .find(|branch| !branch.remote && branch.name == current)
             })
             .and_then(|branch| branch.upstream.as_ref());
+        let pull_blocked = if let Some(action) = self.busy {
+            Some(format!("正在执行 {action}，请稍候"))
+        } else if auto_pull::running(cx) {
+            Some("自动 Pull 正在执行，请稍候".to_string())
+        } else if state.is_none() {
+            Some("仓库状态尚未加载，请刷新".to_string())
+        } else if !idle {
+            Some(format!(
+                "{}，请先解决冲突或完成当前操作",
+                state
+                    .map(|state| state.progress.label())
+                    .unwrap_or("仓库状态不可用")
+            ))
+        } else if !has_head {
+            Some("仓库尚无提交，请先完成第一次提交".to_string())
+        } else if !on_branch {
+            Some("当前是 detached HEAD，请先切换到本地分支".to_string())
+        } else if upstream.is_none() {
+            Some("当前分支未配置上游，请选择远程分支后点击「设为上游」".to_string())
+        } else {
+            None
+        };
+        let checkout_blocked = if let Some(action) = self.busy {
+            Some(format!("正在执行 {action}，请稍候"))
+        } else if auto_pull::running(cx) {
+            Some("自动 Pull 正在执行，请稍候".to_string())
+        } else if state.is_none() {
+            Some("仓库状态尚未加载，请刷新".to_string())
+        } else if !idle {
+            Some("请先解决冲突或完成当前合并/变基操作".to_string())
+        } else if selected.is_none() {
+            Some("请先选择要检出的分支".to_string())
+        } else if same {
+            Some("所选分支已经是当前分支".to_string())
+        } else {
+            None
+        };
+        let integrate_blocked = checkout_blocked.clone().or_else(|| {
+            if !has_head {
+                Some("仓库尚无提交，请先完成第一次提交".to_string())
+            } else if !on_branch {
+                Some("当前是 detached HEAD，请先切到本地分支".to_string())
+            } else {
+                None
+            }
+        });
         let detail = DescriptionList::vertical()
             .columns(1)
             .when_some(selected, |list, branch| {
@@ -712,10 +780,15 @@ impl Render for BranchView {
                     .child(GroupBox::new().id("branch-target-group").outline().title("选择的分支")
                         .child(detail)
                         .child(h_flex().gap_2().flex_wrap()
-                            .child(self.action_button("switch-branch", "Switch 切换", Operation::Switch(target.clone()), clean && selected.is_some_and(|branch| !branch.remote) && !same, cx))
-                            .child(self.action_button("merge-branch", "Merge 合入当前", Operation::Merge(target.clone()), integrate, cx))
-                            .child(self.action_button("rebase-branch", "Rebase 当前变基", Operation::Rebase(target.clone()), integrate, cx)))
-                        .footer("目标分支合入当前分支；变基会重写当前分支的独有提交，执行前需确认。工作区须无未提交改动。"))
+                            .child(self.action_button("checkout-branch", "Checkout 检出", Operation::Checkout(target.clone()), checkout_blocked.is_none(), cx)
+                                .tooltip(checkout_blocked.clone().unwrap_or_else(|| "允许携带未提交修改；若会覆盖本地文件，Git 将拒绝切换".into())))
+                            .child(self.action_button("merge-branch", "Merge 合入当前", Operation::Merge(target.clone()), integrate_blocked.is_none(), cx)
+                                .tooltip(integrate_blocked.clone().unwrap_or_else(|| "自动暂存本地修改，合并目标分支后恢复；冲突需手动解决".into())))
+                            .child(self.action_button("rebase-branch", "Rebase 当前变基", Operation::Rebase(target.clone()), integrate_blocked.is_none(), cx)
+                                .tooltip(integrate_blocked.clone().unwrap_or_else(|| "自动暂存本地修改，变基完成后恢复；会重写当前分支的独有提交".into()))))
+                        .when_some(checkout_blocked, |group, reason| group.child(div().text_xs().text_color(muted).child(format!("Checkout 暂不可用：{reason}"))))
+                        .when_some(integrate_blocked, |group, reason| group.child(div().text_xs().text_color(muted).child(format!("Merge / Rebase 暂不可用：{reason}"))))
+                        .footer("Checkout 允许携带未提交修改。Merge / Rebase 自动暂存并恢复已跟踪文件的本地修改；未跟踪文件有覆盖风险时拒绝操作。远程检出创建本地追踪分支，不覆盖已有分支。"))
                     .child(GroupBox::new().id("branch-remotes-group").outline().title("远程同步")
                         // 没有远程时不渲染空行，避免分组顶部多出一段留白
                         .when(!remotes.is_empty(), |group| {
@@ -724,21 +797,27 @@ impl Render for BranchView {
                         .child(div().text_sm().child(format!("上游：{}", upstream.map(String::as_str).unwrap_or("未设置"))))
                         .child(h_flex().gap_2().flex_wrap()
                             .child(self.action_button("fetch-branches", "Fetch 获取", Operation::Fetch(selected_remote), self.remote.is_some(), cx))
-                            .child(self.action_button("pull-branch", "Pull 快进更新", Operation::Pull, clean && has_head && on_branch && upstream.is_some(), cx))
+                            .child(self.action_button("pull-branch", "Pull 拉取合并", Operation::Pull, pull_blocked.is_none(), cx)
+                                .tooltip(pull_blocked.clone().unwrap_or_else(|| "允许未提交的修改：自动暂存、拉取合并、恢复修改".into())))
                             .child(self.action_button("set-upstream", "设为上游", Operation::SetUpstream(target), idle && on_branch && selected.is_some_and(|branch| branch.remote), cx)))
-                        .footer("Fetch 更新远程引用，Pull 只快进。分叉时先选择上游分支，再合并或变基。"))
+                        .when_some(pull_blocked, |group, reason| group.child(div().text_xs().text_color(muted).child(format!("Pull 暂不可用：{reason}"))))
+                        .footer("手动 Pull 拉取并合并上游，自动暂存并恢复已跟踪文件的本地修改；冲突需手动解决。未跟踪文件有覆盖风险时会拒绝操作。"))
                     .child(self.auto_pull_panel(cx))
                     .child(GroupBox::new().id("branch-create-group").outline().title("新建本地分支")
                         .child(field().label("新分支名称").child(Input::new(&self.name).aria_label("新分支名称").disabled(self.busy.is_some() || !idle)))
                         .child(self.action_button("create-branch", "从当前 HEAD 新建", Operation::Create(new_name.clone()), idle && has_head && !new_name.is_empty(), cx))
-                        .footer("新建只创建分支，不自动切换。选择新分支后点击 Switch。"))
+                        .footer("新建只创建分支，不自动切换。选择新分支后点击 Checkout。"))
                     .when(recover, |panel| panel.child(GroupBox::new().id("branch-conflicts-group").outline().title("冲突与恢复")
-                        .child(div().text_sm().child("「用我的 / 用他的」直接取那一侧的内容并暂存；手动改完文件后点「标记已解决」。Merge 时 ours 是当前分支、theirs 是合入分支，Rebase 时相反。继续可能遇到下一批冲突；中止会丢弃本次解决改动。"))
+                        .child(div().text_sm().child(if restoring {
+                            "本地修改恢复时发生冲突：『保留整合结果』取更新后的版本，『保留本地修改』取自动暂存的版本。也可手动编辑后标记已解决。全部解决后在主窗口提交，不需要 merge --continue。备份保留在 git stash list 中，确认无误后再手动清理；此阶段不提供会丢失修改的自动中止。"
+                        } else {
+                            "「用我的 / 用他的」直接取那一侧的内容并暂存；手动改完文件后点「标记已解决」。Merge 时 ours 是当前分支、theirs 是合入分支，Rebase 时相反。继续可能遇到下一批冲突；中止会丢弃本次解决改动，Git 会尝试恢复自动暂存的本地修改。"
+                        }))
                         .children(conflicts)
                         .child(h_flex().gap_2().flex_wrap()
-                            .child(self.action_button("continue-branch-op", "继续操作", Operation::Continue, resolved, cx))
+                            .child(self.action_button("continue-branch-op", "继续操作", Operation::Continue, integrating && resolved, cx))
                             .when(state.is_some_and(|state| state.progress == Progress::Rebase), |actions| actions.child(self.action_button("skip-rebase-commit", "跳过当前提交…", Operation::Skip, true, cx)))
-                            .child(self.action_button("abort-branch-op", "中止操作…", Operation::Abort, true, cx)))))))
+                            .child(self.action_button("abort-branch-op", "中止操作…", Operation::Abort, integrating, cx)))))))
                 .child(resizable_panel().size(px(320.)).size_range(px(260.)..px(1600.)).child(self.history_panel(cx)))))
     }
 }

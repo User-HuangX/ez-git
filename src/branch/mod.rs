@@ -20,6 +20,8 @@ pub(crate) enum Progress {
     Idle,
     Merge,
     Rebase,
+    /// 自动暂存恢复等操作产生冲突，但没有 MERGE_HEAD / rebase 状态。
+    WorktreeConflict,
     Other,
 }
 
@@ -29,6 +31,7 @@ impl Progress {
             Self::Idle => "正常",
             Self::Merge => "合并中",
             Self::Rebase => "变基中",
+            Self::WorktreeConflict => "工作区冲突（本地修改恢复等）",
             Self::Other => "其他 Git 操作进行中",
         }
     }
@@ -73,7 +76,9 @@ pub(crate) fn snapshot(path: &Path) -> Result<Snapshot> {
         .symbolic_target()?
         .and_then(|name| name.strip_prefix("refs/heads/"))
         .map(str::to_string);
+    let conflicts = conflict_paths(&repo)?;
     let progress = match repo.state() {
+        RepositoryState::Clean if !conflicts.is_empty() => Progress::WorktreeConflict,
         RepositoryState::Clean => Progress::Idle,
         RepositoryState::Merge => Progress::Merge,
         RepositoryState::Rebase
@@ -139,7 +144,6 @@ pub(crate) fn snapshot(path: &Path) -> Result<Snapshot> {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true).recurse_untracked_dirs(true);
     let dirty = repo.statuses(Some(&mut opts))?.len();
-    let conflicts = conflict_paths(&repo)?;
     let history = history::load(&repo, &branches, head)?;
     Ok(Snapshot {
         history,
@@ -174,7 +178,7 @@ pub(crate) enum Operation {
     Create(String),
     Fetch(String),
     Pull,
-    Switch(String),
+    Checkout(String),
     Merge(String),
     Rebase(String),
     SetUpstream(String),
@@ -204,7 +208,7 @@ fn git(path: &Path, args: &[&str]) -> Result<String> {
     // 只有可能写提交的操作需要身份；身份文件损坏也不能挡住 abort。
     if args
         .first()
-        .is_some_and(|command| matches!(*command, "merge" | "rebase"))
+        .is_some_and(|command| matches!(*command, "merge" | "rebase" | "pull"))
         && !args.contains(&"--abort")
     {
         let identity = RepoConfig::resolved(path)?;
@@ -249,17 +253,6 @@ fn git(path: &Path, args: &[&str]) -> Result<String> {
 fn require_idle(state: &Snapshot) -> Result<()> {
     if state.progress != Progress::Idle {
         bail!("{}，请先继续或中止当前操作", state.progress.label());
-    }
-    Ok(())
-}
-
-fn require_clean(state: &Snapshot) -> Result<()> {
-    require_idle(state)?;
-    if state.dirty != 0 {
-        bail!(
-            "有 {} 个未提交的改动（含暂存/未跟踪文件），请先提交后再操作",
-            state.dirty
-        );
     }
     Ok(())
 }
@@ -317,7 +310,12 @@ fn auto_pull_locked(path: &Path) -> Result<AutoPullResult> {
     if let Some(reason) = skip {
         return Ok(AutoPullResult::Skipped(reason));
     }
-    execute_locked(path, &Operation::Pull, &state).map(AutoPullResult::Pulled)
+    // 后台任务保持只快进，不自动合并，也不触碰用户的未提交修改。
+    git(
+        path,
+        &["pull", "--ff-only", "--no-rebase", "--no-autostash"],
+    )
+    .map(AutoPullResult::Pulled)
 }
 
 // ponytail: 跨仓库共享一把锁；需要并行操作多个仓库时换成仓库级锁。
@@ -362,7 +360,7 @@ fn execute_locked(path: &Path, operation: &Operation, expected: &Snapshot) -> Re
             git(path, &["fetch", "--prune", "--", remote])
         }
         Operation::Pull => {
-            require_clean(&state)?;
+            require_idle(&state)?;
             require_head(&state)?;
             let current = state
                 .current
@@ -373,23 +371,68 @@ fn execute_locked(path: &Path, operation: &Operation, expected: &Snapshot) -> Re
             }) {
                 bail!("当前分支没有上游，请选择远程分支后点击「设为上游」");
             }
-            // 不暗中 merge/rebase，也不自动 stash；分叉由用户选择如何整合。
+            // Git 管理 MERGE_AUTOSTASH：合并完成/中止后恢复本地修改；恢复失败会保留 stash。
+            // 未跟踪文件不会进入 autostash，存在覆盖风险时 Git 会安全拒绝操作。
+            let result = git(
+                path,
+                &["pull", "--no-rebase", "--ff", "--autostash", "--no-edit"],
+            );
+            let after = snapshot(path)?;
+            if !after.conflicts.is_empty() {
+                let detail = match result {
+                    Ok(message) => message,
+                    Err(err) => format!("{err:#}"),
+                };
+                bail!(
+                    "Pull 遇到 {} 个冲突，请在冲突面板解决。Git 自动暂存恢复冲突时会保留备份，可用 git stash list 查看。\n{detail}",
+                    after.conflicts.len()
+                );
+            }
+            result.context(
+                "Pull 失败；本地改动由 Git 自动暂存机制保护，请查看仓库状态与 git stash list",
+            )
+        }
+        Operation::Checkout(reference) => {
+            // 普通 switch 允许携带不受影响的本地修改；覆盖风险由 Git 拒绝，不强制检出。
+            require_idle(&state)?;
+            let target = branch_target(&state, reference)?;
+            if !target.remote {
+                return git(path, &["switch", "--no-guess", "--", &target.name]);
+            }
+            let remote = state
+                .remotes
+                .iter()
+                .filter(|remote| target.name.starts_with(&format!("{remote}/")))
+                .max_by_key(|remote| remote.len())
+                .context("无法识别远程分支所属的远程仓库，请刷新后重试")?;
+            let local = &target.name[remote.len() + 1..];
+            if local.starts_with('-')
+                || !git2::Reference::is_valid_name(&format!("refs/heads/{local}"))
+            {
+                bail!("无法从该远程分支生成合法的本地分支名");
+            }
+            if state
+                .branches
+                .iter()
+                .any(|branch| !branch.remote && branch.name == local)
+            {
+                bail!("本地分支 {local} 已存在，请选择该本地分支执行 Checkout；不会覆盖已有分支");
+            }
             git(
                 path,
-                &["pull", "--ff-only", "--no-rebase", "--no-autostash"],
+                &[
+                    "switch",
+                    "--no-guess",
+                    "--track",
+                    "-c",
+                    local,
+                    "--",
+                    reference,
+                ],
             )
-            .context("Pull 只允许快进；若已分叉，请 Fetch 后选择上游执行 Merge 或 Rebase")
-        }
-        Operation::Switch(reference) => {
-            require_clean(&state)?;
-            let target = branch_target(&state, reference)?;
-            if target.remote {
-                bail!("只能 Switch 到本地分支");
-            }
-            git(path, &["switch", "--no-guess", "--", &target.name])
         }
         Operation::Merge(reference) | Operation::Rebase(reference) => {
-            require_clean(&state)?;
+            require_idle(&state)?;
             require_head(&state)?;
             let current = state
                 .current
@@ -399,13 +442,25 @@ fn execute_locked(path: &Path, operation: &Operation, expected: &Snapshot) -> Re
             if reference == &format!("refs/heads/{current}") {
                 bail!("目标不能是当前分支");
             }
-            match operation {
+            let result = match operation {
                 Operation::Merge(_) => git(
                     path,
-                    &["merge", "--no-edit", "--no-autostash", "--", reference],
+                    &["merge", "--no-edit", "--autostash", "--", reference],
                 ),
-                _ => git(path, &["rebase", "--no-autostash", reference]),
+                _ => git(path, &["rebase", "--autostash", reference]),
+            };
+            let after = snapshot(path)?;
+            if !after.conflicts.is_empty() {
+                let detail = match result {
+                    Ok(message) => message,
+                    Err(err) => format!("{err:#}"),
+                };
+                bail!(
+                    "整合或恢复本地修改时遇到 {} 个冲突，请在冲突面板解决。自动暂存恢复冲突时 Git 会保留 stash 备份。\n{detail}",
+                    after.conflicts.len()
+                );
             }
+            result.context("整合失败，请查看 Git 输出与仓库状态；未跟踪文件不会自动暂存，有覆盖风险时 Git 会拒绝操作")
         }
         Operation::SetUpstream(reference) => {
             require_idle(&state)?;
@@ -428,8 +483,10 @@ fn execute_locked(path: &Path, operation: &Operation, expected: &Snapshot) -> Re
             )
         }
         Operation::Resolve { file, side } => {
-            if !matches!(state.progress, Progress::Merge | Progress::Rebase)
-                || !state.conflicts.contains(file)
+            if !matches!(
+                state.progress,
+                Progress::Merge | Progress::Rebase | Progress::WorktreeConflict
+            ) || !state.conflicts.contains(file)
             {
                 bail!("该文件不是当前合并/变基的冲突文件，请刷新后重试");
             }
