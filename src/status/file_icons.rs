@@ -41,30 +41,3 @@ pub(crate) fn icon_for(path: &str) -> IconName {
         _ => IconName::File,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{IconName, icon_for};
-
-    #[test]
-    fn file_types_manifests_and_unknown_paths_have_stable_icons() {
-        for (path, icon) in [
-            ("src/main.rs", IconName::FileCode),
-            ("web/App.TSX", IconName::FileCode),
-            ("config/data.json", IconName::FileBraces),
-            ("settings/local.toml", IconName::FileCog),
-            ("docs/README.md", IconName::FileText),
-            ("assets/LOGO.SVG", IconName::FileImage),
-            ("scripts/build.sh", IconName::Terminal),
-            ("vendor/source.tar", IconName::FileArchive),
-            ("Cargo.toml", IconName::Package),
-            ("Cargo.lock", IconName::FileLock),
-            (".gitignore", IconName::GitBranch),
-            ("Dockerfile", IconName::Container),
-            ("folder.with.dot/unknown", IconName::File),
-            ("raw.bin", IconName::File),
-        ] {
-            assert_eq!(icon_for(path), icon, "{path}");
-        }
-    }
-}

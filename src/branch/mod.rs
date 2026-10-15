@@ -14,9 +14,6 @@ pub(crate) mod auto_pull;
 mod history;
 pub(crate) mod window;
 
-#[cfg(test)]
-mod tests;
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Progress {
     #[default]

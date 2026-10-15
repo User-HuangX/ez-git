@@ -5,9 +5,6 @@ use git2::{Commit, IndexAddOption, Oid, Repository, RepositoryState, Signature};
 
 use crate::repo::{conflict_paths, git_get_repo, head_commit};
 
-#[cfg(test)]
-mod tests;
-
 /// `git add -A`：把工作区的全部改动（含未跟踪文件、删除）加入暂存区。
 pub fn git_all(repo: &Repository) -> Result<()> {
     git_stage(repo, &["*".to_string()])

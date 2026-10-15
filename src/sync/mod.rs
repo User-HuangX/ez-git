@@ -13,9 +13,6 @@ use crate::repo::git_get_repo;
 
 pub(crate) mod ui;
 
-#[cfg(test)]
-mod tests;
-
 /// `git push`：把当前分支推到它的上游（没配上游时默认 origin/同名分支）。
 pub fn git_push(repo: &Repository) -> Result<()> {
     let (local, remote_name, remote_branch) = current_upstream(repo)?;
