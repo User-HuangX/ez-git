@@ -55,14 +55,6 @@ impl Render for Toolbar {
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
-                div()
-                    .id("current-repository")
-                    .min_w_0()
-                    .child(config::ui::repo_button(repo))
-                    .tooltip(move |window, cx| Tooltip::new(repo_path.clone()).build(window, cx)),
-            )
-            .child(div().mx_1().w(px(1.)).h_5().bg(cx.theme().border))
-            .child(
                 h_flex()
                     .gap_1()
                     .items_center()
@@ -94,6 +86,15 @@ impl Render for Toolbar {
                                 this.tree.update(cx, |tree, cx| tree.refresh(cx))
                             })),
                     )),
+            )
+            .child(div().mx_1().w(px(1.)).h_5().bg(cx.theme().border))
+            // 仓库入口放在视图控制之后：最左边先给「展开/收起 + 刷新」
+            .child(
+                div()
+                    .id("current-repository")
+                    .min_w_0()
+                    .child(config::ui::repo_button(repo))
+                    .tooltip(move |window, cx| Tooltip::new(repo_path.clone()).build(window, cx)),
             )
             .child(div().mx_1().w(px(1.)).h_5().bg(cx.theme().border))
             .child(

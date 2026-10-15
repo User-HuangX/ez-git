@@ -3,7 +3,7 @@
 use anyhow::{Result, bail};
 use git2::{Commit, IndexAddOption, Oid, Repository, RepositoryState, Signature};
 
-use crate::repo::{git_get_repo, head_commit};
+use crate::repo::{conflict_paths, git_get_repo, head_commit};
 
 #[cfg(test)]
 mod tests;
@@ -13,8 +13,25 @@ pub fn git_all(repo: &Repository) -> Result<()> {
     git_stage(repo, &["*".to_string()])
 }
 
+/// 暂存的写入口：未解决的冲突路径不能进暂存区——那等于把带 `<<<<<<<` 的内容当成
+/// 「已解决」提交。`git_all` 传的 `*` 也从这里过，所以只拦这一处。
+fn guard_conflicts(repo: &Repository, paths: &[String]) -> Result<()> {
+    let conflicts = conflict_paths(repo)?;
+    let all = paths.iter().any(|path| path == "*");
+    let hit = conflicts
+        .iter()
+        .find(|conflict| all || paths.iter().any(|path| path == *conflict));
+    match hit {
+        Some(conflict) => bail!(
+            "{conflict} 还有未解决的冲突，请先在分支窗口里选「用我的 / 用他的」，或手动改完后标记已解决"
+        ),
+        None => Ok(()),
+    }
+}
+
 /// `git add -- <paths>`：把这几个路径的当前内容写进暂存区（删除也照记）。
 pub fn git_stage(repo: &Repository, paths: &[String]) -> Result<()> {
+    guard_conflicts(repo, paths)?;
     let mut index = repo.index()?;
     index.add_all(paths.iter(), IndexAddOption::DEFAULT, None)?;
     index.write()?;

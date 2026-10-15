@@ -14,7 +14,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::auto_pull;
-use super::{BranchInfo, Operation, Progress, Snapshot};
+use super::{BranchInfo, Choice, Operation, Progress, Snapshot};
 use crate::config::{AutoPullConfig, DEFAULT_AUTO_PULL_INTERVAL_SECS, RepoConfig, current_repo};
 use crate::repo::git_get_repo;
 use crate::status::ui::StatusTreeHandle;
@@ -134,7 +134,11 @@ impl BranchView {
             Operation::Merge(_) => "Merge",
             Operation::Rebase(_) => "Rebase",
             Operation::SetUpstream(_) => "设置上游",
-            Operation::Resolve(_) => "标记已解决",
+            Operation::Resolve {
+                side: Choice::Manual,
+                ..
+            } => "标记已解决",
+            Operation::Resolve { .. } => "取一侧内容",
             Operation::Continue => "继续",
             Operation::Abort => "中止",
             Operation::Skip => "跳过当前提交",
@@ -474,17 +478,30 @@ impl Render for BranchView {
                 );
             }
             for (index, path) in state.conflicts.iter().enumerate() {
+                let mut resolve = |id: (&'static str, usize), label: &'static str, side: Choice| {
+                    self.action_button(
+                        id,
+                        label,
+                        Operation::Resolve {
+                            file: path.clone(),
+                            side,
+                        },
+                        true,
+                        cx,
+                    )
+                };
                 conflicts.push(
                     h_flex()
                         .w_full()
                         .gap_2()
+                        .flex_wrap()
                         .child(div().flex_1().min_w_0().child(path.clone()))
-                        .child(self.action_button(
+                        .child(resolve(("keep-ours", index), "用我的", Choice::Ours))
+                        .child(resolve(("keep-theirs", index), "用他的", Choice::Theirs))
+                        .child(resolve(
                             ("resolve-conflict", index),
                             "标记已解决",
-                            Operation::Resolve(path.clone()),
-                            true,
-                            cx,
+                            Choice::Manual,
                         )),
                 );
             }
@@ -576,7 +593,7 @@ impl Render for BranchView {
                         .child(self.action_button("create-branch", "从当前 HEAD 新建", Operation::Create(new_name.clone()), idle && has_head && !new_name.is_empty(), cx))
                         .footer("新建只创建分支，不自动切换。选择新分支后点击 Switch。"))
                     .when(recover, |panel| panel.child(GroupBox::new().id("branch-conflicts-group").outline().title("冲突与恢复")
-                        .child(div().text_sm().child("先在编辑器解决并保存，再标记已解决。继续可能遇到下一批冲突；中止会丢弃本次解决改动。"))
+                        .child(div().text_sm().child("「用我的 / 用他的」直接取那一侧的内容并暂存；手动改完文件后点「标记已解决」。Merge 时 ours 是当前分支、theirs 是合入分支，Rebase 时相反。继续可能遇到下一批冲突；中止会丢弃本次解决改动。"))
                         .children(conflicts)
                         .child(h_flex().gap_2().flex_wrap()
                             .child(self.action_button("continue-branch-op", "继续操作", Operation::Continue, resolved, cx))

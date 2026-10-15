@@ -27,6 +27,8 @@ use crate::status::{self, Change, LineStats, Node, git_file_diff};
 const GREEN: u32 = 0x4ade80;
 const YELLOW: u32 = 0xfacc15;
 const RED: u32 = 0xf87171;
+/// 冲突单独一档颜色，别和删除的红混淆。
+const PURPLE: u32 = 0xc084fc;
 const CLEAN: u32 = 0xb0b0c0;
 
 /// 改动类型对应的颜色。
@@ -35,6 +37,7 @@ fn color_of(change: Change) -> u32 {
         Change::Added => GREEN,
         Change::Modified => YELLOW,
         Change::Deleted => RED,
+        Change::Conflicted => PURPLE,
         Change::Clean => CLEAN,
     }
 }
@@ -438,6 +441,7 @@ impl Render for StatusTree {
                     Change::Added => "新增",
                     Change::Modified => "修改",
                     Change::Deleted => "删除",
+                    Change::Conflicted => "冲突",
                     Change::Clean => "未修改",
                 };
                 let counts = match (folder, stats.added, stats.removed) {
@@ -525,6 +529,7 @@ impl Render for StatusTree {
                                             Change::Added => "A",
                                             Change::Modified => "M",
                                             Change::Deleted => "D",
+                                            Change::Conflicted => "U",
                                             Change::Clean => "",
                                         }),
                                 )

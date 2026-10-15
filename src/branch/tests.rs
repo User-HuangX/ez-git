@@ -4,7 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use git2::{Oid, Repository, RepositoryInitOptions};
 
-use super::{Operation, Progress, execute, git, snapshot};
+use super::{Choice, Operation, Progress, execute, git, snapshot};
+use crate::status::{Change, Node};
 
 struct Fixture(PathBuf);
 
@@ -29,6 +30,16 @@ impl Fixture {
 
     fn commit(&self, file: &str, text: &str, message: &str) -> Oid {
         fs::write(self.0.join(file), text).unwrap();
+        self.commit_worktree(message)
+    }
+
+    /// 删除文件后提交，用来造「修改/删除」冲突。
+    fn remove(&self, file: &str, message: &str) -> Oid {
+        fs::remove_file(self.0.join(file)).unwrap();
+        self.commit_worktree(message)
+    }
+
+    fn commit_worktree(&self, message: &str) -> Oid {
         let repo = self.repo();
         crate::commit::git_all(&repo).unwrap();
         crate::commit::git_commit(
@@ -67,6 +78,13 @@ fn local(name: &str) -> String {
     format!("refs/heads/{name}")
 }
 
+/// 挑一侧解决当前冲突文件。
+fn resolve(file: &str, side: Choice) -> Operation {
+    Operation::Resolve {
+        file: file.into(),
+        side,
+    }
+}
 #[test]
 fn create_switch_and_dirty_guard_preserve_worktree() {
     let fixture = Fixture::new();
@@ -168,7 +186,7 @@ fn merge_conflict_can_be_resolved_and_continued() {
     assert!(fixture.run(Operation::Switch(local("feature"))).is_err());
     fs::write(fixture.0.join("conflict.txt"), "resolved\n").unwrap();
     fixture
-        .run(Operation::Resolve("conflict.txt".into()))
+        .run(resolve("conflict.txt", Choice::Manual))
         .unwrap();
     fixture.run(Operation::Continue).unwrap();
     let repo = fixture.repo();
@@ -233,7 +251,7 @@ fn rebase_conflict_supports_continue_and_abort() {
     assert!(fixture.run(Operation::Rebase(local("main"))).is_err());
     fs::write(fixture.0.join("conflict.txt"), "resolved\n").unwrap();
     fixture
-        .run(Operation::Resolve("conflict.txt".into()))
+        .run(resolve("conflict.txt", Choice::Manual))
         .unwrap();
     fixture.run(Operation::Continue).unwrap();
     let repo = fixture.repo();
@@ -280,6 +298,132 @@ fn rebase_skip_keeps_later_commits() {
             .unwrap(),
         main
     );
+}
+
+/// 冲突文件在状态树里单独一档，diff 面板也仍然读得到带冲突标记的内容。
+#[test]
+fn conflicted_file_is_marked_and_readable_in_the_main_window() {
+    let fixture = Fixture::new();
+    conflicting_branches(&fixture);
+    assert!(fixture.run(Operation::Merge(local("feature"))).is_err());
+    let repo = fixture.repo();
+
+    let change = crate::status::tree(&repo)
+        .unwrap()
+        .into_iter()
+        .find_map(|node| match node {
+            Node::File { path, change, .. } if path == "conflict.txt" => Some(change),
+            _ => None,
+        });
+    assert_eq!(change, Some(Change::Conflicted));
+
+    let text = crate::status::git_file_diff(&repo, "conflict.txt")
+        .unwrap()
+        .iter()
+        .map(|line| line.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("<<<<<<<"), "{text}");
+    assert!(text.contains(">>>>>>>"), "{text}");
+}
+
+#[test]
+fn merge_conflict_can_take_either_side() {
+    let fixture = Fixture::new();
+    conflicting_branches(&fixture);
+    assert!(fixture.run(Operation::Merge(local("feature"))).is_err());
+    fixture.run(resolve("conflict.txt", Choice::Ours)).unwrap();
+    assert_eq!(
+        fs::read_to_string(fixture.0.join("conflict.txt")).unwrap(),
+        "main\n"
+    );
+    assert!(snapshot(&fixture.0).unwrap().conflicts.is_empty());
+    fixture.run(Operation::Abort).unwrap();
+
+    assert!(fixture.run(Operation::Merge(local("feature"))).is_err());
+    fixture
+        .run(resolve("conflict.txt", Choice::Theirs))
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(fixture.0.join("conflict.txt")).unwrap(),
+        "feature\n"
+    );
+    fixture.run(Operation::Continue).unwrap();
+    assert_eq!(snapshot(&fixture.0).unwrap().progress, Progress::Idle);
+}
+
+#[test]
+fn rebase_conflict_side_follows_rebase_ours_and_theirs() {
+    let fixture = Fixture::new();
+    conflicting_branches(&fixture);
+    fixture.run(Operation::Switch(local("feature"))).unwrap();
+    assert!(fixture.run(Operation::Rebase(local("main"))).is_err());
+    // 变基时 ours 是目标分支（main），theirs 是被重放的提交（feature）。
+    fixture.run(resolve("conflict.txt", Choice::Ours)).unwrap();
+    assert_eq!(
+        fs::read_to_string(fixture.0.join("conflict.txt")).unwrap(),
+        "main\n"
+    );
+    fixture.run(Operation::Abort).unwrap();
+
+    assert!(fixture.run(Operation::Rebase(local("main"))).is_err());
+    fixture
+        .run(resolve("conflict.txt", Choice::Theirs))
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(fixture.0.join("conflict.txt")).unwrap(),
+        "feature\n"
+    );
+    fixture.run(Operation::Continue).unwrap();
+    assert_eq!(snapshot(&fixture.0).unwrap().progress, Progress::Idle);
+}
+
+/// 修改/删除冲突里被删的那一侧在索引里没有条目，取它就是把删除落进索引。
+#[test]
+fn modify_delete_conflict_can_keep_the_deletion() {
+    let fixture = Fixture::new();
+    fixture.commit("gone.txt", "base\n", "base");
+    fixture.run(Operation::Create("feature".into())).unwrap();
+    fixture.run(Operation::Switch(local("feature"))).unwrap();
+    fixture.commit("gone.txt", "feature\n", "feature");
+    fixture.run(Operation::Switch(local("main"))).unwrap();
+    fixture.remove("gone.txt", "delete on main");
+
+    assert!(fixture.run(Operation::Merge(local("feature"))).is_err());
+    assert_eq!(snapshot(&fixture.0).unwrap().conflicts, ["gone.txt"]);
+    fixture.run(resolve("gone.txt", Choice::Ours)).unwrap();
+    assert!(!fixture.0.join("gone.txt").exists());
+    assert!(snapshot(&fixture.0).unwrap().conflicts.is_empty());
+    fixture.run(Operation::Abort).unwrap();
+    // 中止后回到 main 的删除提交，文件仍然不存在。
+    assert!(!fixture.0.join("gone.txt").exists());
+
+    // 另一侧：feature 改了文件，取 theirs 把它拿回来。
+    assert!(fixture.run(Operation::Merge(local("feature"))).is_err());
+    fixture.run(resolve("gone.txt", Choice::Theirs)).unwrap();
+    assert_eq!(
+        fs::read_to_string(fixture.0.join("gone.txt")).unwrap(),
+        "feature\n"
+    );
+    fixture.run(Operation::Continue).unwrap();
+    assert_eq!(snapshot(&fixture.0).unwrap().progress, Progress::Idle);
+}
+
+/// 冲突没解决时，状态树那条线不能把带 `<<<<<<<` 的内容当成「已解决」暂存。
+#[test]
+fn unresolved_conflicts_are_refused_by_the_commit_paths() {
+    let fixture = Fixture::new();
+    conflicting_branches(&fixture);
+    assert!(fixture.run(Operation::Merge(local("feature"))).is_err());
+    let repo = fixture.repo();
+
+    // `git add -A`（全部提交）和单个路径的勾选都要被拦下。
+    assert!(crate::commit::git_all(&repo).is_err());
+    assert!(crate::commit::git_stage(&repo, &["conflict.txt".into()]).is_err());
+    // 其它文件照旧能暂存，只是不许碰冲突路径。
+    fs::write(fixture.0.join("other.txt"), "other\n").unwrap();
+    crate::commit::git_stage(&repo, &["other.txt".into()]).unwrap();
+    assert_eq!(snapshot(&fixture.0).unwrap().conflicts, ["conflict.txt"]);
 }
 
 fn run(path: &Path, operation: Operation) -> anyhow::Result<String> {

@@ -1,6 +1,5 @@
 //! 分支管理：libgit2 读取状态，系统 Git 执行操作并保留标准的恢复流程。
 
-use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, TryLockError};
@@ -9,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use git2::{BranchType, ErrorCode, Oid, RepositoryState, StatusOptions};
 
 use crate::config::RepoConfig;
-use crate::repo::git_get_repo;
+use crate::repo::{conflict_paths, git_get_repo};
 
 pub(crate) mod auto_pull;
 pub(crate) mod window;
@@ -141,17 +140,7 @@ pub(crate) fn snapshot(path: &Path) -> Result<Snapshot> {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true).recurse_untracked_dirs(true);
     let dirty = repo.statuses(Some(&mut opts))?.len();
-    let index = repo.index()?;
-    let mut conflicts = BTreeSet::new();
-    for conflict in index.conflicts()? {
-        let conflict = conflict?;
-        for entry in [conflict.ancestor, conflict.our, conflict.their]
-            .into_iter()
-            .flatten()
-        {
-            conflicts.insert(std::str::from_utf8(&entry.path)?.to_string());
-        }
-    }
+    let conflicts = conflict_paths(&repo)?;
     Ok(Snapshot {
         branches,
         current,
@@ -167,6 +156,17 @@ pub(crate) fn snapshot(path: &Path) -> Result<Snapshot> {
     })
 }
 
+/// 冲突文件取哪一侧的内容。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Choice {
+    /// 取「我们」的版本（git checkout --ours）：Merge 时是当前分支，Rebase 时是目标分支。
+    Ours,
+    /// 取「他们」的版本（git checkout --theirs）：Merge 时是合入分支，Rebase 时是被重放的提交。
+    Theirs,
+    /// 用户已经在编辑器里改好，按工作区内容暂存。
+    Manual,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum Operation {
     Refresh,
@@ -177,7 +177,11 @@ pub(crate) enum Operation {
     Merge(String),
     Rebase(String),
     SetUpstream(String),
-    Resolve(String),
+    /// 解决一个冲突文件：取某一侧的内容，或者用户改完后按工作区内容暂存。
+    Resolve {
+        file: String,
+        side: Choice,
+    },
     Continue,
     Abort,
     Skip,
@@ -422,14 +426,29 @@ fn execute_locked(path: &Path, operation: &Operation, expected: &Snapshot) -> Re
                 ],
             )
         }
-        Operation::Resolve(file) => {
+        Operation::Resolve { file, side } => {
             if !matches!(state.progress, Progress::Merge | Progress::Rebase)
                 || !state.conflicts.contains(file)
             {
                 bail!("该文件不是当前合并/变基的冲突文件，请刷新后重试");
             }
-            // 用户确认已在编辑器解决，再暂存该路径；删除冲突也能标记为解决。
-            git(path, &["add", "-A", "--", file])
+            match side {
+                // 用户确认已在编辑器解决，再暂存该路径；删除冲突也能标记为解决。
+                Choice::Manual => git(path, &["add", "-A", "--", file]),
+                Choice::Ours | Choice::Theirs => {
+                    let flag = if matches!(side, Choice::Theirs) {
+                        "--theirs"
+                    } else {
+                        "--ours"
+                    };
+                    // 这一侧在索引里没有条目时（修改/删除冲突）checkout 会失败，
+                    // 「取这一侧」就是删除文件；真出错时 git rm 的报错更直接。
+                    if git(path, &["checkout", flag, "--", file]).is_err() {
+                        return git(path, &["rm", "-f", "--", file]);
+                    }
+                    git(path, &["add", "-A", "--", file])
+                }
+            }
         }
         Operation::Continue => {
             if !state.conflicts.is_empty() {

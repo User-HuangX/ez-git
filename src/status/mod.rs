@@ -79,6 +79,11 @@ pub struct DiffLine {
 /// 所以等于把整个文件原文读出来，只是增行标绿、删行标红。
 /// 未跟踪文件会整篇算新增，删除的文件整篇算删除。
 pub fn git_file_diff(repo: &Repository, file: &str) -> Result<Vec<DiffLine>> {
+    // 冲突文件的索引里是三个 stage，libgit2 只给得出一个文件头；
+    // 直接把工作区原文（带 <<<<<<< 标记）整篇读出来。
+    if crate::repo::conflict_paths(repo)?.contains(file) {
+        return read_worktree_lines(repo, file);
+    }
     let mut opts = DiffOptions::new();
     opts.pathspec(file)
         .disable_pathspec_match(true)
@@ -153,10 +158,12 @@ pub enum Change {
     Clean,
     /// 新增：未跟踪，或者新进了暂存区（绿）
     Added,
-    /// 修改：内容改动、改名、类型变化或冲突（黄）
+    /// 修改：内容改动、改名或类型变化（黄）
     Modified,
     /// 删除：工作区或者暂存区里被删掉（红）
     Deleted,
+    /// 冲突：合并或变基留下的未解决文件，暂存区里是 ancestor/ours/theirs 三个条目（紫）
+    Conflicted,
 }
 
 /// 目录树节点。
@@ -234,19 +241,21 @@ fn is_staged(status: git2::Status) -> bool {
     )
 }
 
-/// 状态位 → 颜色。删除优先，其次修改，最后新增；冲突按修改处理。
+/// 状态位 → 颜色。冲突单独一档（暂存区里是三个 stage，其它状态位都不可信），
+/// 其次是删除、修改、新增。
 fn change_of(status: git2::Status) -> Change {
     use git2::Status as S;
 
-    if status.intersects(S::INDEX_DELETED | S::WT_DELETED) {
+    if status.intersects(S::CONFLICTED) {
+        Change::Conflicted
+    } else if status.intersects(S::INDEX_DELETED | S::WT_DELETED) {
         Change::Deleted
     } else if status.intersects(
         S::INDEX_MODIFIED
             | S::INDEX_RENAMED
             | S::INDEX_TYPECHANGE
             | S::WT_MODIFIED
-            | S::WT_TYPECHANGE
-            | S::CONFLICTED,
+            | S::WT_TYPECHANGE,
     ) {
         Change::Modified
     } else if status.intersects(S::INDEX_NEW | S::WT_NEW) {
