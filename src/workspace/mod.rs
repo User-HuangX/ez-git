@@ -21,6 +21,19 @@ fn tree_expanded(cx: &App) -> bool {
     cx.try_global::<TreeExpanded>().is_none_or(|state| state.0)
 }
 
+/// 提交模式：左侧只列有改动的文件，打钩即暂存，提交时只提交打钩的那些。
+struct CommitMode(bool);
+
+impl Global for CommitMode {}
+
+pub(crate) fn commit_mode(cx: &App) -> bool {
+    cx.try_global::<CommitMode>().is_some_and(|state| state.0)
+}
+
+pub(super) fn set_commit_mode(enabled: bool, cx: &mut App) {
+    cx.set_global(CommitMode(enabled));
+}
+
 /// 启动时决定打开哪个仓库：优先历史里最近打开的一个，路径不在了才退回运行目录；
 /// 目录还不是 Git 仓库就初始化。失败留状态树显示，不在这儿拦一道。
 fn open_startup_repo() {
@@ -50,10 +63,11 @@ impl Workspace {
         cx.set_global(TreeExpanded(true));
         open_startup_repo();
         let diff = cx.new(|cx| DiffView::new(window, cx));
-        let tree = cx.new(|cx| StatusTree::new(diff.clone(), cx));
+        let tree = cx.new(|cx| StatusTree::new(window, diff.clone(), cx));
         // 提交后通过弱句柄刷新，避免提交模块依赖整个工作区。
         cx.set_global(StatusTreeHandle::new(&tree));
         let toolbar = cx.new(|cx| Toolbar::new(tree.clone(), cx));
+        crate::branch::auto_pull::init(cx);
         Self {
             toolbar,
             tree,

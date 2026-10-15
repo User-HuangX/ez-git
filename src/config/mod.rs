@@ -20,7 +20,7 @@ const REPO_CONFIG_FILE: &str = "ez-git.toml";
 const DEFAULT_HISTORY_LIMIT: usize = 20;
 
 /// 应用级配置：打开过的仓库目录（最近使用在前），以及作者、邮箱兜底。
-#[derive(Deserialize, Serialize)]
+#[derive(Default, Deserialize, Serialize)]
 pub struct Config {
     /// 打开历史的上限，可在 config.toml 里修改。
     #[serde(default)]
@@ -31,17 +31,6 @@ pub struct Config {
     pub author: String,
     #[serde(default)]
     pub email: String,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            history_limit: DEFAULT_HISTORY_LIMIT,
-            repositories: Vec::new(),
-            author: String::new(),
-            email: String::new(),
-        }
-    }
 }
 
 impl Config {
@@ -101,6 +90,38 @@ pub fn current_repo() -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("先在配置里选择仓库"))
 }
 
+pub const DEFAULT_AUTO_PULL_INTERVAL_SECS: u64 = 300;
+
+/// 自动 Pull 默认关闭；旧配置中的周期 0 表示使用默认周期。
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AutoPullConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub interval_secs: u64,
+}
+
+impl AutoPullConfig {
+    pub fn interval(self) -> Result<u64> {
+        Self::check_interval(match self.interval_secs {
+            0 => DEFAULT_AUTO_PULL_INTERVAL_SECS,
+            seconds => seconds,
+        })
+    }
+
+    pub fn parse_interval(text: &str) -> Result<u64> {
+        let seconds = text.trim().parse::<u64>().context("周期必须是整数秒")?;
+        Self::check_interval(seconds)
+    }
+
+    fn check_interval(seconds: u64) -> Result<u64> {
+        if !(10..=86_400).contains(&seconds) {
+            bail!("自动 Pull 周期必须在 10～86400 秒之间");
+        }
+        Ok(seconds)
+    }
+}
+
 /// 单个仓库的设置。
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RepoConfig {
@@ -108,6 +129,8 @@ pub struct RepoConfig {
     pub author: String,
     #[serde(default)]
     pub email: String,
+    #[serde(default)]
+    pub auto_pull: AutoPullConfig,
 }
 
 impl RepoConfig {
@@ -137,10 +160,30 @@ impl RepoConfig {
         }
     }
 
+    /// 只更新身份，保留自动 Pull 等其他仓库设置。
+    pub fn save_identity(repo: &Path, author: String, email: String) -> Result<()> {
+        validate(&author, &email)?;
+        let mut config = Self::load(repo)?;
+        config.author = author;
+        config.email = email;
+        config.save(repo)
+    }
+
+    pub fn save_auto_pull(repo: &Path, settings: AutoPullConfig) -> Result<()> {
+        settings.interval()?;
+        let mut config = Self::load(repo)?;
+        config.auto_pull = settings;
+        config.save(repo)
+    }
+
     pub fn save(&self, repo: &Path) -> Result<()> {
         let path = config_path(repo)?;
         let text = toml::to_string_pretty(self)?;
-        std::fs::write(&path, text).with_context(|| format!("写入 {} 失败", path.display()))
+        // 定时任务同时读取配置，先完整写临时文件，再替换，避免读到截断的 TOML。
+        let temporary = path.with_extension(format!("toml.tmp-{}", std::process::id()));
+        std::fs::write(&temporary, text)
+            .with_context(|| format!("写入 {} 失败", temporary.display()))?;
+        std::fs::rename(&temporary, &path).with_context(|| format!("保存 {} 失败", path.display()))
     }
 }
 

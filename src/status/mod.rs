@@ -11,9 +11,12 @@ use git2::{Diff, DiffFormat, DiffOptions, Patch, Repository, StatusOptions};
 use crate::repo::head_commit;
 
 pub(crate) mod diff;
+pub(crate) mod file_icons;
+
+pub(crate) mod ui;
+
 #[cfg(test)]
 mod tests;
-pub(crate) mod ui;
 
 /// HEAD 到当前工作区的增删行数；二进制文件不计行数。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -76,6 +79,11 @@ pub struct DiffLine {
 /// 所以等于把整个文件原文读出来，只是增行标绿、删行标红。
 /// 未跟踪文件会整篇算新增，删除的文件整篇算删除。
 pub fn git_file_diff(repo: &Repository, file: &str) -> Result<Vec<DiffLine>> {
+    // 冲突文件的索引里是三个 stage，libgit2 只给得出一个文件头；
+    // 直接把工作区原文（带 <<<<<<< 标记）整篇读出来。
+    if crate::repo::conflict_paths(repo)?.contains(file) {
+        return read_worktree_lines(repo, file);
+    }
     let mut opts = DiffOptions::new();
     opts.pathspec(file)
         .disable_pathspec_match(true)
@@ -150,10 +158,12 @@ pub enum Change {
     Clean,
     /// 新增：未跟踪，或者新进了暂存区（绿）
     Added,
-    /// 修改：内容改动、改名、类型变化或冲突（黄）
+    /// 修改：内容改动、改名或类型变化（黄）
     Modified,
     /// 删除：工作区或者暂存区里被删掉（红）
     Deleted,
+    /// 冲突：合并或变基留下的未解决文件，暂存区里是 ancestor/ours/theirs 三个条目（紫）
+    Conflicted,
 }
 
 /// 目录树节点。
@@ -170,6 +180,8 @@ pub enum Node {
         path: String,
         change: Change,
         stats: LineStats,
+        /// 暂存区里相对 HEAD 有改动；就是提交模式里的打钩状态。
+        staged: bool,
     },
 }
 
@@ -185,13 +197,13 @@ impl Node {
 /// 读仓库里所有文件并标出改动类型；目录按名字排序并排在文件前面。
 pub fn tree(repo: &Repository) -> Result<Vec<Node>> {
     // 索引里的文件就是已跟踪文件，默认没改动；状态再覆盖或补上未跟踪文件
-    let mut files: BTreeMap<String, (Change, LineStats)> = repo
+    let mut files: BTreeMap<String, (Change, LineStats, bool)> = repo
         .index()?
         .iter()
         .map(|entry| {
             (
                 String::from_utf8_lossy(&entry.path).into_owned(),
-                (Change::Clean, LineStats::default()),
+                (Change::Clean, LineStats::default(), false),
             )
         })
         .collect();
@@ -202,11 +214,15 @@ pub fn tree(repo: &Repository) -> Result<Vec<Node>> {
         files.insert(
             // 路径不保证是合法 UTF-8，保留 lossy 转换，避免整个状态读取失败。
             String::from_utf8_lossy(entry.path_bytes()).into_owned(),
-            (change_of(entry.status()), LineStats::default()),
+            (
+                change_of(entry.status()),
+                LineStats::default(),
+                is_staged(entry.status()),
+            ),
         );
     }
     for (path, stats) in git_line_stats(repo)? {
-        if let Some((_, counts)) = files.get_mut(&path) {
+        if let Some((_, counts, _)) = files.get_mut(&path) {
             *counts = stats;
         }
     }
@@ -214,19 +230,32 @@ pub fn tree(repo: &Repository) -> Result<Vec<Node>> {
     Ok(build(files))
 }
 
-/// 状态位 → 颜色。删除优先，其次修改，最后新增；冲突按修改处理。
+/// 暂存区里相对 HEAD 有没有改动。
+fn is_staged(status: git2::Status) -> bool {
+    status.intersects(
+        git2::Status::INDEX_NEW
+            | git2::Status::INDEX_MODIFIED
+            | git2::Status::INDEX_DELETED
+            | git2::Status::INDEX_RENAMED
+            | git2::Status::INDEX_TYPECHANGE,
+    )
+}
+
+/// 状态位 → 颜色。冲突单独一档（暂存区里是三个 stage，其它状态位都不可信），
+/// 其次是删除、修改、新增。
 fn change_of(status: git2::Status) -> Change {
     use git2::Status as S;
 
-    if status.intersects(S::INDEX_DELETED | S::WT_DELETED) {
+    if status.intersects(S::CONFLICTED) {
+        Change::Conflicted
+    } else if status.intersects(S::INDEX_DELETED | S::WT_DELETED) {
         Change::Deleted
     } else if status.intersects(
         S::INDEX_MODIFIED
             | S::INDEX_RENAMED
             | S::INDEX_TYPECHANGE
             | S::WT_MODIFIED
-            | S::WT_TYPECHANGE
-            | S::CONFLICTED,
+            | S::WT_TYPECHANGE,
     ) {
         Change::Modified
     } else if status.intersects(S::INDEX_NEW | S::WT_NEW) {
@@ -240,19 +269,19 @@ fn change_of(status: git2::Status) -> Change {
 #[derive(Default)]
 struct Builder {
     dirs: BTreeMap<String, Builder>,
-    files: BTreeMap<String, (Change, LineStats)>,
+    files: BTreeMap<String, (Change, LineStats, bool)>,
 }
 
 impl Builder {
-    fn insert(&mut self, path: &str, change: Change, stats: LineStats) {
+    fn insert(&mut self, path: &str, change: Change, stats: LineStats, staged: bool) {
         match path.split_once('/') {
             Some((dir, rest)) => self
                 .dirs
                 .entry(dir.to_string())
                 .or_default()
-                .insert(rest, change, stats),
+                .insert(rest, change, stats, staged),
             None => {
-                self.files.insert(path.to_string(), (change, stats));
+                self.files.insert(path.to_string(), (change, stats, staged));
             }
         }
     }
@@ -279,21 +308,22 @@ impl Builder {
             .chain(
                 self.files
                     .into_iter()
-                    .map(|(name, (change, stats))| Node::File {
+                    .map(|(name, (change, stats, staged))| Node::File {
                         path: join(&name),
                         name,
                         change,
                         stats,
+                        staged,
                     }),
             )
             .collect()
     }
 }
 
-fn build(files: BTreeMap<String, (Change, LineStats)>) -> Vec<Node> {
+fn build(files: BTreeMap<String, (Change, LineStats, bool)>) -> Vec<Node> {
     let mut builder = Builder::default();
-    for (path, (change, stats)) in files {
-        builder.insert(&path, change, stats);
+    for (path, (change, stats, staged)) in files {
+        builder.insert(&path, change, stats, staged);
     }
     builder.into_nodes("")
 }

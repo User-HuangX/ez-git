@@ -1,5 +1,6 @@
 //! 仓库领域：打开 / 初始化仓库，以及 head、身份、状态干净与否这些仓库级基础能力。
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -43,4 +44,24 @@ pub(crate) fn head_commit(repo: &Repository) -> Result<Option<Commit<'_>>> {
         Err(err) if err.code() == ErrorCode::UnbornBranch => Ok(None),
         Err(err) => Err(err.into()),
     }
+}
+
+/// 索引里未解决的冲突路径；ancestor/ours/theirs 任一条目都算（修改/删除冲突只有两个）。
+/// 没有冲突时是空集合，且不必遍历索引。
+pub(crate) fn conflict_paths(repo: &Repository) -> Result<BTreeSet<String>> {
+    let index = repo.index()?;
+    let mut paths = BTreeSet::new();
+    if !index.has_conflicts() {
+        return Ok(paths);
+    }
+    for conflict in index.conflicts()? {
+        let conflict = conflict?;
+        for entry in [conflict.ancestor, conflict.our, conflict.their]
+            .into_iter()
+            .flatten()
+        {
+            paths.insert(String::from_utf8_lossy(&entry.path).into_owned());
+        }
+    }
+    Ok(paths)
 }
