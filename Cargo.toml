@@ -6,6 +6,6 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 git2 = { version = "0.21.0", features = ["https", "ssh"] }
-gpui-kit = { version = "0.7.1", features = ["tree-sitter-languages"] }
+gpui-kit = { version = "0.7.3", features = ["tree-sitter-languages"] }
 serde = { version = "1.0.229", features = ["derive"] }
-toml = "1.1.6"
+toml = "1.1.7"

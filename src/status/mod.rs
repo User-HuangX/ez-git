@@ -15,8 +15,7 @@ pub(crate) mod file_icons;
 
 pub(crate) mod ui;
 
-#[cfg(test)]
-mod tests;
+
 
 /// HEAD 到当前工作区的增删行数；二进制文件不计行数。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

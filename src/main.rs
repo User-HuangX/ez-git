@@ -10,7 +10,6 @@ mod sync;
 mod workspace;
 
 fn main() {
-    println!("123");
     application().with_assets(assets::AllAssets).run(|cx| {
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
